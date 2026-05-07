@@ -1,8 +1,31 @@
+# Credentials — never commit
 .env
+
+# Python
 .venv/
-logs/
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
+
+# Logs
+logs/
+*.log
+
+# macOS
 .DS_Store
+
+# Testing
 .pytest_cache/
+
+# Operational state — personal data, not useful in a public repo
+state/
+performance.json
+
+# Claude Code local settings
+.claude/
+
+# Auto-generated watchlists (rebuilt monthly from build_watchlist.py)
+# Uncomment if you want to exclude them:
+# watchlist.txt
+# watchlist_catalyst.txt
