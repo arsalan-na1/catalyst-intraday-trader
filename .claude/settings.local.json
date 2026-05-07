@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -m py_compile config.py stream.py scorer.py trader.py position_monitor.py bot.py telegram_handler.py)",
+      "Bash(python3 -m py_compile bot.py stream.py news.py scorer.py technicals.py trader.py telegram_handler.py daily_summary.py microcap_screener.py market_calendar.py earnings_calendar.py config.py logger.py cooldown_store.py http_utils.py position_monitor.py build_watchlist.py build_catalyst_watchlist.py fundamentals.py finnhub_data.py reddit_sentiment.py premarket_scanner.py)",
+      "Bash(python3 -m py_compile config.py daily_summary.py trader.py bot.py)",
+      "Bash(python3 -m py_compile trader.py)",
+      "Bash(python3 -m py_compile config.py scorer.py position_monitor.py microcap_screener.py daily_summary.py)",
+      "Bash(python3 -m py_compile telegram_handler.py trader.py news.py fundamentals.py finnhub_data.py bot.py)",
+      "Bash(claude plugin *)",
+      "mcp__plugin_context7_context7__resolve-library-id",
+      "mcp__plugin_context7_context7__query-docs",
+      "Bash(python3 -c \"import finnhub; c = finnhub.Client; methods = [m for m in dir\\(c\\) if not m.startswith\\('_'\\)]; print\\('\\\\n'.join\\(methods\\)\\)\")",
+      "Bash(ssh aso@192.168.1.183 \"cd ~/trading-bot && source .venv/bin/activate && python3 -c \\\\\"import finnhub; import inspect; methods=[m for m in dir\\(finnhub.Client\\) if not m.startswith\\('_'\\)]; print\\('\\\\n'.join\\(sorted\\(methods\\)\\)\\)\\\\\"\")",
+      "Bash(python3 -m py_compile short_interest.py estimate_revisions.py sector_momentum.py finnhub_data.py config.py scorer.py daily_summary.py trader.py premarket_scanner.py bot.py microcap_screener.py position_monitor.py)",
+      "Bash(python3 -m py_compile bot.py stream.py news.py scorer.py technicals.py trader.py telegram_handler.py daily_summary.py microcap_screener.py market_calendar.py earnings_calendar.py config.py logger.py cooldown_store.py http_utils.py position_monitor.py build_watchlist.py build_catalyst_watchlist.py fundamentals.py finnhub_data.py reddit_sentiment.py premarket_scanner.py short_interest.py estimate_revisions.py sector_momentum.py)",
+      "Bash(python3 -m py_compile trader.py bot.py daily_summary.py)"
+    ]
+  }
+}

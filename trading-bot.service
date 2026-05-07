@@ -1,0 +1,21 @@
+[Unit]
+Description=Event-driven catalyst trading bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=aso
+WorkingDirectory=/home/aso/trading-bot
+EnvironmentFile=/home/aso/trading-bot/.env
+ExecStart=/home/aso/trading-bot/.venv/bin/python /home/aso/trading-bot/bot.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+# Basic hardening — optional but cheap wins.
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
