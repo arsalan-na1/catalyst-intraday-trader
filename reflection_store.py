@@ -210,10 +210,14 @@ def _estimate_tokens(text: str) -> int:
 
 
 def _format_pct(value: object) -> str:
-    """Render a decimal like 0.052 as '+5%'. Returns '?' for non-numeric."""
+    """Render a decimal like 0.023 as '+2.3%'. Returns '?' for non-numeric.
+
+    One decimal place keeps sub-1% differences visible (e.g. 2.3% raw vs 1.8%
+    alpha would both round to +2% at zero decimals, hiding the distinction).
+    """
     if not isinstance(value, (int, float)):
         return "?"
-    return f"{value * 100:+.0f}%"
+    return f"{value * 100:+.1f}%"
 
 
 def _short_date(ts_str: object) -> str:
