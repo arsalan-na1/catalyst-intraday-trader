@@ -29,7 +29,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Literal
+from typing import Any, Literal
 
 from alpaca.data.historical.stock import StockHistoricalDataClient
 from google import genai
@@ -38,6 +38,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 import config
 from estimate_revisions import get_estimate_revisions
+from self_improvement import format_insights_block, load_insights_if_fresh
 from finnhub_data import (
     get_congressional_trades,
     get_earnings_calendar,
@@ -142,6 +143,25 @@ class CatalystVerdict(BaseModel):
         ),
     )
     reasoning: str = Field(description="One paragraph explaining the catalyst, setup, and all trade parameter decisions.")
+    catalyst_quality: Literal["strong", "moderate", "weak"] = Field(
+        default="moderate",
+        description=(
+            "Catalyst quality rating from analysis. 'strong' = real, well-sourced, "
+            "proportional to the move (e.g. beat-and-raise, FDA approval, M&A premium). "
+            "'moderate' = real but partial confirmation or some priced-in risk. "
+            "'weak' = thin sourcing, routine news, or the gap is extended beyond what the news justifies."
+        ),
+    )
+    reversal_risk: Literal["low", "medium", "high"] = Field(
+        default="medium",
+        description=(
+            "Reversal risk rating from analysis. 'low' = clear path higher with healthy "
+            "momentum and supportive tape. 'medium' = some headwinds (overall market "
+            "weakness, sector rotation, modest extension) but thesis still tracks. "
+            "'high' = stock already extended, RSI > 80 with weak volume, sell-the-news "
+            "setup, thin float, or earnings beat already priced in pre-market."
+        ),
+    )
     skip_reason: str | None = Field(
         default=None,
         description=(
@@ -205,6 +225,9 @@ class TriggerContext:
     volume_ratio: float
     technicals: Technicals | None = None  # populated by scorer after tech fetch
     trigger_type: str = "intraday"  # "intraday" | "gap_open"
+    # Latest session VWAP threaded through from stream.TriggerEvent (None on
+    # synthetic CLI triggers and on any bar that did not carry a VWAP value).
+    window_vwap: float | None = None
 
 
 _RESEARCH_SYSTEM_INSTRUCTION = """You are a research analyst investigating a sudden
@@ -229,123 +252,19 @@ Write a plain-text briefing (under 300 words) covering:
 
 Do NOT return JSON. Do NOT invent events. If no catalyst is found, say so explicitly."""
 
-_VERDICT_SYSTEM_INSTRUCTION = """You are a quantitative analyst for an intraday event-driven strategy.
-Given a trigger snapshot, news items, optional technical indicators, fundamentals, alternative data
-(insider sentiment, earnings calendar, congressional trades, earnings history), social sentiment (Reddit),
-and a Google-grounded research briefing, produce a structured verdict that weighs BOTH the fundamental
-catalyst AND the technical setup.
+_VERDICT_SYSTEM_INSTRUCTION = """You are an intraday catalyst trading analyst. Your job is to evaluate
+whether a stock's current move has the characteristics of a trade worth
+taking RIGHT NOW — not whether the company is a good long-term investment.
 
-════════════════════════════════════════════════
-TECHNICAL SETUP — apply these rules precisely
-════════════════════════════════════════════════
+You think like a desk trader, not a portfolio manager. You care about:
+- Whether the catalyst is real and proportional to the move
+- Whether momentum is likely to continue for the next 2-4 hours
+- Whether the risk of a sharp reversal is low enough to justify entry
 
-The technical setup dramatically affects the probability of a trade working.
-
-PENALIZE (lower confidence by 2–3 points; set technical_signal='bearish'):
-  • RSI > 80 — stock is overbought/extended, high fade risk on any catalyst
-  • Price more than 40% below 52-week high — broken chart, no institutional support
-  • Volume ratio < 1.5× ADV on a price spike — thin conviction, likely to reverse
-  • Price below both SMA50 and SMA200 — confirmed downtrend
-
-REWARD (raise confidence by 1–2 points; set technical_signal='bullish'):
-  • Price within 15% of 52-week high — strong uptrend, institutional accumulation
-  • Uptrend confirmed: price > SMA50 > SMA200
-  • RSI in 55–72 range — momentum without being overextended
-  • Volume ratio > 3× ADV — high institutional conviction behind the move
-
-CONTRADICTORY SIGNALS (news bullish BUT technicals bearish):
-  • Set technical_signal='neutral' — NOT 'bullish'; contradictions lower conviction
-  • Lower confidence by 2 additional points vs what fundamentals alone would give
-  • A technically broken or overbought stock rarely sustains a catalyst-driven rally
-  • Populate skip_reason explaining the contradiction if confidence drops below 7
-
-NEUTRAL (sideways, incomplete data, or genuinely mixed):
-  • Set technical_signal='neutral'; apply no boost or penalty to confidence
-
-════════════════════════════════════════════════
-FUNDAMENTAL SCORING
-════════════════════════════════════════════════
-
-catalyst_found: false if research is ambiguous, routine, or unrelated to the move
-
-magnitude (1–10): expected price impact of the catalyst
-  FDA approval/rejection 8–10 | Earnings beat >20% vs estimates 7–9
-  M&A at premium 8–10 | Analyst upgrade with large PT raise 4–6
-  Contract win 4–7 | Buyback/dividend 3–5 | Insider buying cluster 5–7
-
-confidence (1–10): certainty this specific catalyst explains this specific move
-  Official SEC/FDA source: start at 8 | Press release only: subtract 1
-  Social media only: max 4 | Apply technical penalties/bonuses on top
-
-already_priced_in: true if catalyst broke pre-market and price fully gapped; false if intraday
-catalyst_type: pick the single best fit from the enum
-suggested_entry: near current price if catalyst is fresh
-
-════════════════════════════════════════════════
-CONTEXT RULES
-════════════════════════════════════════════════
-
-- Large-cap index stock (S&P 500, Nasdaq 100) moving under 3%: require strong
-  primary-source confirmation before catalyst_found=true.
-- Any stock moving over 10%: set catalyst_found=true and describe the most plausible
-  catalyst even if sourcing is incomplete — moves of that size are rarely random.
-- Earnings seasons (April, July, October, January): weight earnings catalysts higher;
-  look for EPS beats/misses, revenue guidance, and forward guidance changes.
-- Distinguish intraday from pre-market: if catalyst_type='earnings', already_priced_in
-  should reflect whether the full opening gap has already captured the move.
-
-When scoring catalyst strength, apply these weights to the QUANTITATIVE SIGNALS section:
-- Earnings beat + estimate revision score >= +2: weight heavily — consistent beats with
-  accelerating revisions indicate strong fundamental momentum.
-- Short squeeze setup (squeeze_score=high) + price breakout: weight heavily, but note
-  squeeze reversals are violent — set wider stops and shorter hold times.
-- Insider buying (bullish signal) + positive catalyst: strong confirmation — insiders
-  have informational advantage. Raise confidence 1–2 points.
-- Insider selling during positive catalyst: cautionary signal — do not dismiss the
-  catalyst but reduce position size accordingly. Lower confidence 1 point.
-- Weak or negative sector momentum (bear/strong_bear): the sector is selling off;
-  require a stronger catalyst to fight the tape. Lower confidence 1 point unless the
-  catalyst is M&A or FDA (idiosyncratic, sector-independent).
-- M&A/buyout: weight acquisition premium and deal certainty; check for regulatory risk.
-- FDA approval: weight trial phase (Phase 3 > Phase 2), indication size, and competition.
-
-════════════════════════════════════════════════
-TRADE PARAMETERS — set these for every verdict
-════════════════════════════════════════════════
-
-Based on catalyst strength, technicals, and risk/reward, set all five parameters:
-
-take_profit_pct: Expected upside as a decimal. Aggressive for high-conviction breakouts
-  (0.20–0.35 for magnitude 9–10), conservative for uncertain setups (0.08–0.12 for
-  magnitude 5–6). Gap-open plays that are already up 20%+ should target additional move.
-
-stop_loss_pct: Loss limit from entry as a positive decimal. Wider for volatile low-float
-  stocks and binary FDA events (0.08–0.10). Tighter for large-caps with clear catalysts
-  (0.02–0.04). Set it at the level where the thesis is broken, not just noise.
-
-position_size_pct: Fraction of portfolio to deploy. Scale up for 9–10 confidence
-  (0.10–0.12). Scale down for uncertain setups (0.02–0.05). Use 0.02–0.05 for
-  biotech/FDA binary events due to gap-down risk on adverse decisions.
-
-hold_strategy + max_hold_minutes: 'momentum' plays expect a fast 30–60 min move.
-  'catalyst' plays unfold over 90–240 min as news spreads. 'swing' plays can run
-  240–390 min as institutions absorb the catalyst. Set max_hold_minutes consistently
-  with the hold_strategy.
-
-should_trade: Your explicit trade/no-trade decision. Set to FALSE if:
-  • No real catalyst confirmed (routine news, social speculation only)
-  • Stock already up 30%+ before your entry — the move is priced in
-  • RSI > 85 — severely overextended, high reversal risk
-  • Risk/reward is unfavorable (TP too close to current price for the SL risk)
-  • Technicals severely broken AND catalyst is weak or unconfirmed
-  Skipping bad trades is as important as entering good ones.
-
-skip_reason: Required when should_trade=false. One sentence. Set to null when
-  should_trade=true.
-
-Do not use fixed values. Analyze each trade individually.
-
-Return valid JSON only."""
+You do NOT hedge every sentence. You form a clear view and state it.
+You gather evidence first, form a conclusion second — never the reverse.
+When price action and narrative conflict, you say which one you trust and why.
+You respond only in valid JSON. No markdown, no preamble, no explanation outside the JSON."""
 
 
 _POSITION_EVAL_SYSTEM_INSTRUCTION = """\
@@ -445,30 +364,90 @@ class Scorer:
         self._alert_callback = None
         # Optional regime detector label (HMM); None until set by bot.
         self._current_regime_label: str = "unknown"
+        # Cached self-improvement insights — refreshed when state/insights.json mtime changes.
+        self._insights_cache: dict | None = None
+        self._insights_mtime: float | None = None
+        # Optional ReflectionStore — set by bot.py at startup. When present,
+        # _build_verdict_prompt injects same-ticker + cross-ticker prior
+        # reflections under a "PRIOR LESSONS" section.
+        self._reflection_store: Any = None
+
+    def _get_reflections_block(self, ticker: str) -> str:
+        """Render PRIOR LESSONS injection block for the given ticker.
+
+        Returns "" when no store is wired or no usable reflections exist.
+        Token budget cap matches config.REFLECTION_INJECTED_TOKEN_BUDGET;
+        the helper drops oldest cross-ticker first, then oldest same-ticker.
+        Failure modes are silent — a bad store must never block scoring.
+        """
+        store = self._reflection_store
+        if store is None:
+            return ""
+        try:
+            from reflection_store import format_lessons_block
+
+            same = store.get_recent(
+                ticker, n=config.REFLECTION_MAX_PER_TICKER_INJECTED,
+            )
+            cross = store.get_global_lessons(
+                n=config.REFLECTION_MAX_GLOBAL_INJECTED, exclude_ticker=ticker,
+            )
+            return format_lessons_block(
+                same, cross, ticker, max_tokens=config.REFLECTION_INJECTED_TOKEN_BUDGET,
+            )
+        except Exception:
+            log.debug("reflections block render failed", exc_info=True)
+            return ""
+
+    def _get_insights_block(self) -> str:
+        """Return the formatted lessons block, or empty string when no fresh insights file exists.
+
+        Cached by mtime so we re-parse only when self_improvement writes a new file.
+        Failure-modes are silent — a bad/missing insights file must never block scoring.
+        """
+        try:
+            from self_improvement import INSIGHTS_PATH
+            if not INSIGHTS_PATH.exists():
+                self._insights_cache = None
+                self._insights_mtime = None
+                return ""
+            mtime = INSIGHTS_PATH.stat().st_mtime
+            if self._insights_mtime != mtime:
+                self._insights_cache = load_insights_if_fresh()
+                self._insights_mtime = mtime
+            if self._insights_cache is None:
+                return ""
+            return format_insights_block(self._insights_cache)
+        except Exception:
+            log.debug("insights load failed; continuing without lessons", exc_info=True)
+            return ""
 
     def _record_call_cost(self, is_grounded: bool) -> bool:
-        """Add the cost of an upcoming Gemini call to the monthly tally and
-        update _budget_mode. Returns True if the call should proceed.
+        """Decide whether an upcoming Gemini call may proceed and, if so, add
+        its cost to the monthly tally. Returns True only when the call is
+        actually allowed — blocked calls do NOT accrue cost (the caller must
+        skip the request).
 
         - At 100% of budget: set _budget_mode='halted', log critical, fire alert,
-          return False (caller must skip the call).
-        - At 80% (only if currently 'normal'): set 'ungrounded_only', warn, alert.
-        - Below 80%: passthrough, return True.
+          return False (caller skips, no cost added).
+        - At 80% (only if currently 'normal'): set 'ungrounded_only', warn, alert,
+          and still allow the current call (cost added).
+        - Below 80%: passthrough, cost added, True.
         """
         cost = (
             config.GEMINI_COST_PER_GROUNDED_CALL
             if is_grounded
             else config.GEMINI_COST_PER_UNGROUNDED_CALL
         )
-        self.monthly_cost_estimate += cost
         cap = config.MONTHLY_GEMINI_BUDGET_USD
-        used = self.monthly_cost_estimate
+        projected = self.monthly_cost_estimate + cost
 
-        if used >= cap:
+        if projected >= cap:
             if self._budget_mode != "halted":
                 self._budget_mode = "halted"
                 msg = (
-                    f"🚨 Gemini monthly budget exhausted (${used:.2f}) — "
+                    f"🚨 Gemini monthly budget exhausted "
+                    f"(${self.monthly_cost_estimate:.2f}) — "
                     f"all Gemini calls halted until next month. Bot running "
                     f"on TP/SL/timeout rules only."
                 )
@@ -481,6 +460,10 @@ class Scorer:
                     except Exception:
                         log.exception("budget alert callback failed")
             return False
+
+        # Call is allowed — commit the cost.
+        self.monthly_cost_estimate = projected
+        used = self.monthly_cost_estimate
 
         if used >= cap * 0.8 and self._budget_mode == "normal":
             self._budget_mode = "ungrounded_only"
@@ -515,10 +498,15 @@ class Scorer:
         self._cache[ticker] = (datetime.now(timezone.utc), verdict)
 
     def _check_hourly_limit(self) -> bool:
-        """Return True if we can proceed; False if the hourly API call cap is exceeded.
+        """Return True if we have headroom under the hourly API call cap.
 
-        Fails open on any error so a bad clock or deque corruption never silently
-        drops a potentially good trade.
+        This is a non-mutating check — it does NOT reserve a slot. Callers
+        must invoke `_consume_hourly_slot()` immediately before firing the
+        actual Gemini request, after every other gate (budget/halt) has
+        passed, so blocked calls don't burn slots.
+
+        Fails open on any error so a bad clock or deque corruption never
+        silently drops a potentially good trade.
         """
         try:
             now = time.monotonic()
@@ -530,11 +518,18 @@ class Scorer:
                     len(self._hourly_calls),
                 )
                 return False
-            self._hourly_calls.append(now)
             return True
         except Exception:
             log.exception("hourly limit check failed; proceeding with Gemini call")
             return True  # fail open
+
+    def _consume_hourly_slot(self) -> None:
+        """Reserve one slot in the hourly window. Call only after all gates pass
+        and immediately before firing the actual Gemini request."""
+        try:
+            self._hourly_calls.append(time.monotonic())
+        except Exception:
+            log.debug("hourly slot consume failed", exc_info=True)
 
     @staticmethod
     def _news_block(news: list[NewsItem]) -> str:
@@ -751,61 +746,79 @@ class Scorer:
         quant_signals: dict | None = None,
         sector_name: str = "",
     ) -> str:
-        if tech is not None:
-            tech_section = (
-                f"\nTECHNICAL INDICATORS — apply penalty/reward rules from system instruction:\n"
-                f"{tech.to_prompt_text()}"
-            )
-        else:
-            tech_section = (
-                "\nTechnical indicators: unavailable — "
-                "treat as neutral; do not boost or penalize confidence."
-            )
-        fund_section = f"\n{self._fundamentals_block(fundamentals or {}, ctx.price)}"
-        alt_section  = f"\n{self._alt_data_block(insider or {}, earnings_cal or {}, congress or {}, earnings_surp or {})}"
-        reddit_section = f"\n{self._reddit_block(reddit or {})}"
-
-        qs = quant_signals or {}
-        quant_block = self._quant_signals_block(
-            qs.get("short_interest"),
-            qs.get("estimate_revisions"),
-            qs.get("insider_score"),
-            qs.get("sector_momentum"),
-            sector_name=sector_name,
+        gap_pct_val = abs(ctx.price_move_pct) * 100
+        rsi_val = (
+            f"{tech.rsi:.0f}"
+            if tech is not None and tech.rsi is not None
+            else "N/A"
         )
-        quant_section = f"\n{quant_block}\n" if quant_block else ""
-
-        atr_note = self._atr_hint(tech)
-
-        if ctx.trigger_type == "gap_open":
-            trigger_line = f"Trigger: GAP OPEN +{ctx.price_move_pct:.1%} vs previous session close (overnight catalyst)"
-        else:
-            trigger_line = f"Price move in last 2 minutes: {ctx.price_move_pct:.2%}"
-
-        regime_line = (
-            f"\nMarket regime (HMM/SPY): {self._current_regime_label}"
-            if self._current_regime_label != "unknown"
-            else ""
+        news_summary = self._news_block(news)
+        beat_rate = (earnings_surp or {}).get("beat_rate")
+        earnings_beat = str(beat_rate) if beat_rate else "N/A"
+        guidance_change = "N/A"
+        market_regime = self._current_regime_label or "unknown"
+        insights_block = self._get_insights_block() or "(none)"
+        # Per-ticker + cross-ticker post-trade reflections. When the store has
+        # no usable entries the block is empty and we omit the section
+        # entirely (per spec: do NOT inject "no prior lessons").
+        reflections_block = self._get_reflections_block(ctx.ticker)
+        reflections_section = (
+            f"\n{reflections_block}\n" if reflections_block else ""
         )
 
         prompt = (
-            f"Ticker: {ctx.ticker}\n"
-            f"Current price: ${ctx.price:.2f}\n"
-            f"{trigger_line}{regime_line}\n"
-            f"Volume ratio vs expected-so-far: {ctx.volume_ratio:.1f}× ADV\n"
-            f"{quant_section}\n"
-            f"Recent news items:\n{self._news_block(news)}\n"
-            f"{tech_section}\n"
-            f"{fund_section}\n"
-            f"{alt_section}\n"
-            f"{reddit_section}\n\n"
-            f"Research briefing (Google-grounded):\n{research}\n"
-            f"{atr_note}\n\n"
-            "Produce a structured verdict as JSON. Technical setup heavily affects "
-            "confidence — a broken chart or overbought RSI reduces confidence even "
-            "on strong fundamental catalysts. Contradictory signals → technical_signal='neutral'. "
-            "Set all trade parameters (take_profit_pct, stop_loss_pct, position_size_pct, "
-            "hold_strategy, max_hold_minutes) and make an explicit should_trade decision."
+            "Evaluate this intraday catalyst trade opportunity. Work through each\n"
+            "section in order before giving your final score. Do not jump to the\n"
+            "conclusion first.\n\n"
+            f"TICKER: {ctx.ticker}\n"
+            f"TRIGGER: {ctx.trigger_type}\n"
+            f"GAP: {gap_pct_val:.1f}%\n"
+            f"VOLUME RATIO: {ctx.volume_ratio:.1f}x average\n"
+            f"PRICE: ${ctx.price:.2f}\n"
+            f"RSI: {rsi_val}\n"
+            f"NEWS SUMMARY: {news_summary}\n"
+            f"EARNINGS BEAT: {earnings_beat}  (if available, else \"N/A\")\n"
+            f"GUIDANCE CHANGE: {guidance_change}  (if available, else \"N/A\")\n"
+            f"SECTOR REGIME: {market_regime}\n"
+            f"RECENT INSIGHTS: {insights_block}\n"
+            f"{reflections_section}\n"
+            "Work through these four questions in order:\n\n"
+            "1. CATALYST QUALITY\n"
+            "Is the catalyst real and significant? For earnings: was it a\n"
+            "beat-and-raise (best), beat-and-hold (neutral), or beat-and-lower (trap)?\n"
+            "Is the gap size proportional to the news, or does the stock look\n"
+            "extended beyond what the news justifies? Rate quality: strong / moderate / weak.\n\n"
+            "2. MOMENTUM SUSTAINABILITY  \n"
+            "Based on gap size, volume ratio, and RSI — is this move likely to\n"
+            "continue or fade in the next 2-4 hours? Stocks that gap 20%+ on 5x volume\n"
+            "with RSI under 75 tend to grind higher. Stocks already at RSI 85+ on moderate\n"
+            "volume often stall. Is there a clear path higher or is this a likely\n"
+            "sell-the-news situation?\n\n"
+            "3. REVERSAL RISK\n"
+            "What is the single most likely reason this trade fails? (e.g. overall\n"
+            "market weakness, sector rotation, stock already extended from prior run,\n"
+            "thin float, earnings beat already priced in premarket.) How severe would\n"
+            "a reversal likely be — sharp and fast, or gradual?\n\n"
+            "4. FINAL VERDICT\n"
+            "Based only on what you reasoned above — not gut feel — give:\n"
+            "- confidence: integer 1-10 (1=strong skip, 10=strong buy)\n"
+            "- verdict: \"buy\", \"skip\", or \"avoid\"  \n"
+            "- reason: one sentence max, no hedging\n"
+            "- catalyst_quality: \"strong\", \"moderate\", or \"weak\"\n"
+            "- reversal_risk: \"low\", \"medium\", or \"high\"\n\n"
+            "Respond in this exact JSON format:\n"
+            "{\n"
+            "  \"confidence\": <int>,\n"
+            "  \"verdict\": \"<buy|skip|avoid>\",\n"
+            "  \"reason\": \"<one sentence>\",\n"
+            "  \"catalyst_quality\": \"<strong|moderate|weak>\",\n"
+            "  \"reversal_risk\": \"<low|medium|high>\",\n"
+            "  \"reasoning\": {\n"
+            "    \"catalyst\": \"<2-3 sentences>\",\n"
+            "    \"momentum\": \"<2-3 sentences>\",\n"
+            "    \"reversal_risk\": \"<2-3 sentences>\"\n"
+            "  }\n"
+            "}"
         )
         log.debug(
             "[SCORER] verdict prompt for %s: %d chars", ctx.ticker, len(prompt)
@@ -829,6 +842,7 @@ class Scorer:
             return None
         prompt = self._build_research_prompt(ctx, news)
         await self._limiter.acquire()
+        self._consume_hourly_slot()
         self.calls_today += 1
         try:
             response = await self._client.aio.models.generate_content(
@@ -876,31 +890,54 @@ class Scorer:
             sector_name=sector_name,
         )
         await self._limiter.acquire()
+        self._consume_hourly_slot()
         self.calls_today += 1
-        try:
-            response = await self._client.aio.models.generate_content(
-                model=_MODEL_VERDICT,
-                contents=prompt,
-                config=genai_types.GenerateContentConfig(
-                    system_instruction=_VERDICT_SYSTEM_INSTRUCTION,
-                    response_mime_type="application/json",
-                    response_schema=CatalystVerdict,
-                    temperature=0.2,
-                ),
-            )
-        except Exception:
-            log.exception("gemini verdict call failed for %s", ctx.ticker)
-            return None
+        # Retry once on transient failure (timeouts, 5xx) — common at market open
+        # when Gemini is under heavy load. The retry uses a single 3s backoff and
+        # only the second failure is error-logged.
+        response = None
+        for attempt in (1, 2):
+            try:
+                response = await self._client.aio.models.generate_content(
+                    model=_MODEL_VERDICT,
+                    contents=prompt,
+                    config=genai_types.GenerateContentConfig(
+                        system_instruction=_VERDICT_SYSTEM_INSTRUCTION,
+                        response_mime_type="application/json",
+                        response_schema=CatalystVerdict,
+                        temperature=0.2,
+                    ),
+                )
+                break
+            except Exception as exc:
+                if attempt == 1:
+                    log.warning(
+                        "gemini verdict call failed for %s (attempt 1, retrying in 3s): %r",
+                        ctx.ticker, exc,
+                    )
+                    await asyncio.sleep(3.0)
+                    continue
+                log.exception("gemini verdict call failed for %s after retry", ctx.ticker)
+                return None
 
         text = getattr(response, "text", None) or ""
         if not text:
             log.warning("gemini verdict returned empty text for %s", ctx.ticker)
             return None
         try:
-            return CatalystVerdict.model_validate_json(text)
+            verdict = CatalystVerdict.model_validate_json(text)
         except ValidationError:
             log.exception("gemini verdict failed validation for %s: %s", ctx.ticker, text[:300])
             return None
+        log.info(
+            "[VERDICT] %s: should_trade=%s conf=%d mag=%d catalyst=%s "
+            "catalyst_quality=%s reversal_risk=%s technical=%s",
+            ctx.ticker, verdict.should_trade, verdict.confidence,
+            verdict.magnitude_estimate, verdict.catalyst_type,
+            verdict.catalyst_quality, verdict.reversal_risk,
+            verdict.technical_signal,
+        )
+        return verdict
 
     async def _score_without_grounding(
         self,
@@ -961,9 +998,9 @@ class Scorer:
             self.calls_skipped += 1
             return None, None, {}
 
-        # Record the scoring attempt before entering the semaphore so rapid
-        # burst triggers for the same ticker block each other.
-        self._last_scored[ctx.ticker] = now_mono
+        # Cooldown is set only on success (see end of this function). A failed
+        # Gemini call must NOT poison the per-ticker 30-min cooldown — the next
+        # trigger for this ticker should be allowed to retry immediately.
 
         # Opt 1: skip expensive Google Search grounding for weak signals.
         use_grounding = not (
@@ -975,22 +1012,44 @@ class Scorer:
             use_grounding = False
 
         async with self._sem:
+            # Each helper already catches its own internal errors and returns
+            # None / {}. return_exceptions=True is a defense-in-depth: a future
+            # library upgrade that raises a new exception type past the helper's
+            # try/except shouldn't kill the whole scoring path. Failed sources
+            # are logged and substituted with None; downstream consumers all
+            # treat None / {} as "signal unavailable".
+            _enrichment_sources = (
+                ("technicals",
+                 get_technicals(ctx.ticker, self._hist_client, ctx.price)
+                 if self._hist_client else _coro_none()),
+                ("fundamentals",       get_fundamentals(ctx.ticker)),
+                ("insider_sentiment",  get_insider_sentiment(ctx.ticker)),
+                ("earnings_calendar",  get_earnings_calendar(ctx.ticker)),
+                ("congressional",      get_congressional_trades(ctx.ticker)),
+                ("earnings_surprise",  get_earnings_surprise(ctx.ticker)),
+                ("reddit_sentiment",   get_reddit_sentiment(ctx.ticker)),
+                ("short_interest",     get_short_interest(ctx.ticker)),
+                ("estimate_revisions", get_estimate_revisions(ctx.ticker)),
+                ("insider_score",      get_insider_score(ctx.ticker)),
+            )
+            _raw = await asyncio.gather(
+                *(coro for _, coro in _enrichment_sources),
+                return_exceptions=True,
+            )
+            _safe: list = []
+            for (name, _), result in zip(_enrichment_sources, _raw):
+                if isinstance(result, BaseException):
+                    log.warning(
+                        "[SCORER] enrichment fetch '%s' raised for %s: %r",
+                        name, ctx.ticker, result,
+                    )
+                    _safe.append(None)
+                else:
+                    _safe.append(result)
             (tech, fundamentals,
              insider, earnings_cal, congress, earnings_surp,
              reddit,
-             short_int, est_rev, ins_score) = await asyncio.gather(
-                get_technicals(ctx.ticker, self._hist_client, ctx.price)
-                if self._hist_client else _coro_none(),
-                get_fundamentals(ctx.ticker),
-                get_insider_sentiment(ctx.ticker),
-                get_earnings_calendar(ctx.ticker),
-                get_congressional_trades(ctx.ticker),
-                get_earnings_surprise(ctx.ticker),
-                get_reddit_sentiment(ctx.ticker),
-                get_short_interest(ctx.ticker),
-                get_estimate_revisions(ctx.ticker),
-                get_insider_score(ctx.ticker),
-            )
+             short_int, est_rev, ins_score) = _safe
 
             # Sector momentum needs the sector from fundamentals; fetch after gather.
             sector_name = (fundamentals or {}).get("sector", "") or ""
@@ -1044,6 +1103,7 @@ class Scorer:
 
         if verdict is not None:
             self._cache_put(ctx.ticker, verdict)
+            self._last_scored[ctx.ticker] = now_mono
         return verdict, tech, quant_signals
 
     # --- open-position re-evaluation ---
@@ -1061,6 +1121,9 @@ class Scorer:
         quant_signals: dict | None = None,
         sector_name: str = "",
     ) -> str:
+        # NOTE: Reflections are injected into _build_verdict_prompt only.
+        # Position-eval injection deferred to v2 — needs filtering design
+        # (loss-only? same-side? recency-weighted?). See HANDOFF.md.
         current_price = ctx.price
         pnl_pct = (current_price - entry_price) / entry_price if entry_price > 0 else 0.0
         remaining_to_tp = original_take_profit_pct - pnl_pct
@@ -1125,11 +1188,27 @@ class Scorer:
         Fetches fresh quant signals (uses TTL caches so mostly instant).
         """
         # Fetch fresh quant signals outside the semaphore (data I/O, not Gemini quota).
-        short_int, est_rev, ins_score = await asyncio.gather(
-            get_short_interest(ctx.ticker),
-            get_estimate_revisions(ctx.ticker),
-            get_insider_score(ctx.ticker),
+        # return_exceptions=True so one source raising can't abort re-evaluation.
+        _quant_sources = (
+            ("short_interest",     get_short_interest(ctx.ticker)),
+            ("estimate_revisions", get_estimate_revisions(ctx.ticker)),
+            ("insider_score",      get_insider_score(ctx.ticker)),
         )
+        _raw = await asyncio.gather(
+            *(coro for _, coro in _quant_sources),
+            return_exceptions=True,
+        )
+        _safe: list = []
+        for (name, _), result in zip(_quant_sources, _raw):
+            if isinstance(result, BaseException):
+                log.warning(
+                    "[SCORER] position-eval fetch '%s' raised for %s: %r",
+                    name, ctx.ticker, result,
+                )
+                _safe.append(None)
+            else:
+                _safe.append(result)
+        short_int, est_rev, ins_score = _safe
         sector_mom = await get_sector_momentum(sector, self._hist_client)
         quant_signals: dict = {
             "short_interest": short_int,
@@ -1159,6 +1238,7 @@ class Scorer:
                 self.calls_skipped += 1
                 return None
             await self._limiter.acquire()
+            self._consume_hourly_slot()
             self.calls_today += 1
             try:
                 response = await asyncio.wait_for(

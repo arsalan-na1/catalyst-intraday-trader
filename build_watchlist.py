@@ -114,7 +114,7 @@ def _fetch_wikipedia_index(url: str, name: str) -> set[str]:
     resp.raise_for_status()
 
     try:
-        tables = pd.read_html(resp.text)
+        tables = pd.read_html(io.StringIO(resp.text))
     except Exception as exc:
         log.warning("pd.read_html failed for %s: %s; trying BeautifulSoup fallback", name, exc)
         return _fetch_wikipedia_bs4(resp.text, name)

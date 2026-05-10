@@ -32,7 +32,7 @@ import logging
 import random
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import date, datetime, time as _dt_time, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from alpaca.data.enums import DataFeed
@@ -68,6 +68,12 @@ class TriggerEvent:
     window_high: float
     window_low: float
     trigger_type: str = field(default="intraday")  # "intraday" | "gap_open"
+    # Latest session VWAP from the bar that fired the trigger. None when the
+    # bar payload omitted vwap (e.g. some IEX bars early in the session).
+    window_vwap: float | None = None
+    # True when the ticker is on the earnings calendar at trigger time.
+    # Used downstream to relax confidence and opening-bell gates.
+    is_earnings: bool = False
 
     def summary(self) -> str:
         tag = f"[{self.trigger_type}] " if self.trigger_type != "intraday" else ""
@@ -259,6 +265,10 @@ class TriggerDetector:
         self._vol_confirm_count: dict[str, int] = {}
         self._gap_triggered_today: set[str] = set()
         self._session_date: date | None = None
+        # Last seen VWAP per ticker (from the most recent bar). Populated as
+        # bars arrive and threaded onto TriggerEvent so downstream Gemini
+        # scoring can reason about chasing-vs-VWAP entries.
+        self._last_vwap: dict[str, float] = {}
 
     def _maybe_reset_session(self, bar_ts: datetime) -> None:
         bar_date = bar_ts.astimezone(config.MARKET_TZ).date()
@@ -268,6 +278,10 @@ class TriggerDetector:
             self._price_window.clear()
             self._vol_confirm_count.clear()
             self._gap_triggered_today.clear()
+            self._last_vwap.clear()
+            # Also clear last-trigger timestamps so a ticker that fired near
+            # EOD yesterday isn't suppressed by a stale cooldown at today's open.
+            self._last_trigger.clear()
             self._session_date = bar_date
 
     def _update_price_window(self, ticker: str, bar) -> tuple[float, float]:
@@ -321,6 +335,10 @@ class TriggerDetector:
             "[GAP OPEN] %s gap=+%.1f%% open=$%.2f prev_close=$%.2f",
             ticker, gap_pct * 100, open_price, prev_c,
         )
+        is_earnings = (
+            self._earnings_calendar is not None
+            and ticker in self._earnings_calendar.get_tickers()
+        )
         event = TriggerEvent(
             ticker=ticker,
             price=open_price,
@@ -332,6 +350,8 @@ class TriggerDetector:
             window_high=float(bar.high),
             window_low=float(bar.low),
             trigger_type="gap_open",
+            window_vwap=self._last_vwap.get(ticker),
+            is_earnings=is_earnings,
         )
         self._main_loop.call_soon_threadsafe(self._out.put_nowait, event)
 
@@ -341,6 +361,18 @@ class TriggerDetector:
 
         self._cum_volume[ticker] = self._cum_volume.get(ticker, 0) + int(bar.volume)
         window_low, window_high = self._update_price_window(ticker, bar)
+
+        # Capture VWAP from the bar payload (Alpaca minute bars include vwap).
+        # getattr is defensive — if a bar variant ever omits the field we just
+        # skip the update rather than raising.
+        bar_vwap = getattr(bar, "vwap", None)
+        if bar_vwap is not None:
+            try:
+                vwap_f = float(bar_vwap)
+                if vwap_f > 0:
+                    self._last_vwap[ticker] = vwap_f
+            except (TypeError, ValueError):
+                pass
 
         # Gap-open check: fires once per ticker at 9:30 ET if the bar's open
         # price is >= GAP_OPEN_THRESHOLD above the previous session close.
@@ -355,16 +387,34 @@ class TriggerDetector:
         except Exception:
             log.warning("market clock check failed for %s; assuming open", ticker)
 
+        # Earnings + large gap-up override: a confirmed earnings catalyst with a
+        # gap of 20%+ vs prior close is exactly the setup the opening-bell filter
+        # would otherwise wrongly suppress (e.g. NVDA-class beats). Bypass the
+        # filter for that combination only.
+        is_earnings = (
+            self._earnings_calendar is not None
+            and ticker in self._earnings_calendar.get_tickers()
+        )
+        prev_c = self._prev_close.get(ticker)
+        gap_up_pct = (float(bar.close) - prev_c) / prev_c if prev_c else 0.0
+        earnings_gap_override = is_earnings and gap_up_pct >= 0.20
+
         try:
             minutes_in = await self._calendar.minutes_since_open()
             if 0 <= minutes_in < config.OPENING_BELL_MINUTES:
-                bar_et = bar.timestamp.astimezone(config.MARKET_TZ)
-                log.info(
-                    "[OPENING BELL] suppressed %s at %s — too close to open",
-                    ticker,
-                    bar_et.strftime("%H:%M:%S"),
-                )
-                return
+                if earnings_gap_override:
+                    log.info(
+                        "[OPENING BELL] %s bypassed — earnings catalyst with %.0f%% gap",
+                        ticker, gap_up_pct * 100,
+                    )
+                else:
+                    bar_et = bar.timestamp.astimezone(config.MARKET_TZ)
+                    log.info(
+                        "[OPENING BELL] suppressed %s at %s — too close to open",
+                        ticker,
+                        bar_et.strftime("%H:%M:%S"),
+                    )
+                    return
         except Exception:
             log.warning("minutes_since_open check failed for %s; skipping opening bell filter", ticker)
 
@@ -444,6 +494,8 @@ class TriggerDetector:
             triggered_at=bar.timestamp,
             window_high=window_high,
             window_low=window_low,
+            window_vwap=self._last_vwap.get(ticker),
+            is_earnings=is_earnings,
         )
         self._last_trigger[ticker] = bar.timestamp
         log.info("TRIGGER %s", event.summary())
@@ -539,6 +591,7 @@ async def run_stream(
 
             # Run the blocking stream in a thread. When it exits (disconnect or
             # error), we land back here and either reconnect or exit cleanly.
+            connected_at = asyncio.get_running_loop().time()
             stream_task = asyncio.create_task(asyncio.to_thread(stream.run))
             stop_task = asyncio.create_task(stop_event.wait())
 
@@ -557,8 +610,15 @@ async def run_stream(
                 return
 
             # Stream exited on its own. Reconnect with backoff.
+            # If the connection ran ≥60s, treat it as healthy and reset the
+            # backoff floor — otherwise a single late-day disconnect
+            # ratchets the next reconnect delay up to 60s for no reason.
+            ran_secs = asyncio.get_running_loop().time() - connected_at
+            if ran_secs >= 60.0:
+                backoff = 1.0
             exc = stream_task.exception() if stream_task.done() else None
-            log.warning("WS stream exited%s; reconnecting in %.1fs", f" with {exc}" if exc else "", backoff)
+            log.warning("WS stream exited%s after %.0fs; reconnecting in %.1fs",
+                        f" with {exc}" if exc else "", ran_secs, backoff)
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=backoff)
                 return  # stop_event fired during backoff

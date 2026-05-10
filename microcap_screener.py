@@ -46,7 +46,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -119,12 +118,43 @@ class MicrocapScreener:
         self._alerted: dict[str, datetime] = {}
         # Reset trigger: ET date the alerted dict belongs to
         self._alerted_session: date | None = None
-        # Cached ADV per symbol; populated lazily per poll.
-        self._adv_cache: dict[str, float] = {}
-        # Cached market cap (None = checked, missing) so we skip repeats fast.
-        self._market_cap_cache: dict[str, float | None] = {}
-        # Opt 3: monotonic timestamp of last Gemini evaluation per ticker (15-min cooldown).
-        self._last_evaluated: dict[str, float] = {}
+        # Cached ADV per symbol; (adv_value, cached_at). Pruned at 24h via
+        # _prune_caches so multi-day sessions don't accumulate stale entries.
+        self._adv_cache: dict[str, tuple[float, datetime]] = {}
+        # Cached market cap (None = checked, no data); (shares_or_None, cached_at).
+        self._market_cap_cache: dict[str, tuple[float | None, datetime]] = {}
+        # Last Gemini evaluation timestamp per ticker (15-min cooldown);
+        # pruned at MICROCAP_DEDUP_HOURS via _prune_caches.
+        self._last_evaluated: dict[str, datetime] = {}
+
+    def _prune_caches(self) -> None:
+        """Drop cache entries older than their TTL.
+
+        Run at the start of every poll cycle. The other quant-signal caches
+        in the project all prune; without this, _adv_cache / _market_cap_cache /
+        _last_evaluated would grow monotonically across multi-day sessions
+        (bounded by symbols seen, but inconsistent and untidy).
+        """
+        now = datetime.now(timezone.utc)
+        cutoff_24h = now - timedelta(hours=24)
+        cutoff_dedup = now - timedelta(hours=config.MICROCAP_DEDUP_HOURS)
+
+        before = (len(self._adv_cache), len(self._market_cap_cache), len(self._last_evaluated))
+        self._adv_cache = {
+            k: v for k, v in self._adv_cache.items() if v[1] >= cutoff_24h
+        }
+        self._market_cap_cache = {
+            k: v for k, v in self._market_cap_cache.items() if v[1] >= cutoff_24h
+        }
+        self._last_evaluated = {
+            k: v for k, v in self._last_evaluated.items() if v >= cutoff_dedup
+        }
+        after = (len(self._adv_cache), len(self._market_cap_cache), len(self._last_evaluated))
+        if before != after:
+            log.debug(
+                "%s pruned caches: adv %d→%d, mcap %d→%d, last_eval %d→%d",
+                _LOG_PREFIX, *(v for pair in zip(before, after) for v in pair),
+            )
 
     # --- public entry point ---
 
@@ -132,6 +162,9 @@ class MicrocapScreener:
         log.info("%s screener starting (poll=%ss)", _LOG_PREFIX, config.MICROCAP_POLL_SECONDS)
         while not stop_event.is_set():
             try:
+                # Prune every cycle (regardless of market hours) so the
+                # caches stay bounded even on holidays / weekends.
+                self._prune_caches()
                 if await self._calendar.is_market_open():
                     await self._poll_once()
                 else:
@@ -203,7 +236,8 @@ class MicrocapScreener:
             return
 
         today_volume = int(daily_bar.get("v") or 0)
-        adv = self._adv_cache.get(symbol, 0.0)
+        adv_entry = self._adv_cache.get(symbol)
+        adv = adv_entry[0] if adv_entry else 0.0
         if adv <= 0:
             log.debug("%s %s no ADV baseline; skip", _LOG_PREFIX, symbol)
             return
@@ -237,7 +271,8 @@ class MicrocapScreener:
                 if self._dynamic_sub_queue is not None:
                     await self._dynamic_sub_queue.put(symbol)
                 if self._shared_adv is not None:
-                    adv_val = self._adv_cache.get(symbol, 0.0)
+                    adv_entry2 = self._adv_cache.get(symbol)
+                    adv_val = adv_entry2[0] if adv_entry2 else 0.0
                     if adv_val > 0:
                         self._shared_adv[symbol] = adv_val
                 log.info("%s subscribed %s to WS (no mcap data)", _LOG_PREFIX, symbol)
@@ -263,12 +298,13 @@ class MicrocapScreener:
             )
             return
 
-        now_mono = time.monotonic()
+        now_dt = datetime.now(timezone.utc)
         last_eval = self._last_evaluated.get(symbol)
-        if last_eval is not None and now_mono - last_eval < 900:  # 15 minutes
+        if last_eval is not None and (now_dt - last_eval).total_seconds() < 900:  # 15 minutes
+            age_min = (now_dt - last_eval).total_seconds() / 60
             log.debug(
                 "%s %s evaluated %.0fmin ago; skipping (15-min cooldown)",
-                _LOG_PREFIX, symbol, (now_mono - last_eval) / 60,
+                _LOG_PREFIX, symbol, age_min,
             )
             return
 
@@ -302,7 +338,7 @@ class MicrocapScreener:
                           _LOG_PREFIX, symbol)
             quick_verdict = None
 
-        self._last_evaluated[symbol] = time.monotonic()
+        self._last_evaluated[symbol] = datetime.now(timezone.utc)
 
         if quick_verdict is not None and not quick_verdict.should_trade:
             log.info(
@@ -490,19 +526,21 @@ class MicrocapScreener:
         except Exception:
             log.exception("%s ADV prefetch failed", _LOG_PREFIX)
             adv = {}
+        cached_at = datetime.now(timezone.utc)
         for sym in missing:
             # Cache 0.0 for symbols with no ADV so we skip them next time too.
-            self._adv_cache[sym] = adv.get(sym, 0.0)
+            self._adv_cache[sym] = (adv.get(sym, 0.0), cached_at)
 
     async def _get_market_cap(self, symbol: str, price: float) -> float | None:
-        if symbol in self._market_cap_cache:
-            shares = self._market_cap_cache[symbol]
+        cached_entry = self._market_cap_cache.get(symbol)
+        if cached_entry is not None:
+            shares = cached_entry[0]
             return shares * price if shares else None
         try:
             asset = await asyncio.to_thread(self._trading.get_asset, symbol)
         except Exception:
             log.debug("%s get_asset(%s) failed", _LOG_PREFIX, symbol, exc_info=True)
-            self._market_cap_cache[symbol] = None
+            self._market_cap_cache[symbol] = (None, datetime.now(timezone.utc))
             return None
         # alpaca-py's Asset model does not surface shares_outstanding on every
         # tier — fall back to None so the symbol is skipped.
@@ -511,10 +549,11 @@ class MicrocapScreener:
             shares_f = float(shares) if shares is not None else 0.0
         except (TypeError, ValueError):
             shares_f = 0.0
+        cached_at = datetime.now(timezone.utc)
         if shares_f <= 0:
-            self._market_cap_cache[symbol] = None
+            self._market_cap_cache[symbol] = (None, cached_at)
             return None
-        self._market_cap_cache[symbol] = shares_f
+        self._market_cap_cache[symbol] = (shares_f, cached_at)
         return shares_f * price
 
 

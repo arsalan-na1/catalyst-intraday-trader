@@ -16,9 +16,10 @@ import argparse
 import asyncio
 import json
 import logging
+import math
 import signal
 import sys
-from datetime import datetime, time as _dt_time, timezone
+from datetime import datetime, time as _dt_time, timedelta, timezone
 
 import aiohttp
 from alpaca.data.historical.stock import StockHistoricalDataClient
@@ -35,7 +36,11 @@ from microcap_screener import supervised_run as run_microcap_screener
 from premarket_scanner import run_premarket_scanner
 from position_monitor import run_position_monitor
 from news import determine_sector, fetch_news, is_analyst_action, is_biotech_catalyst, is_insider_buying
+from kronos_scorer import get_continuation_prob
+from reflection_generator import ReflectionGenerator
+from reflection_store import ReflectionStore
 from scorer import Scorer, TriggerContext
+from self_improvement import run_nightly_analysis
 from stream import TriggerEvent, load_watchlist, prefetch_adv, prefetch_prev_close, run_stream
 from telegram_handler import TelegramHandler
 from trader import Trader
@@ -134,6 +139,7 @@ async def _process_trigger(
             price_move_pct=event.price_move_pct,
             volume_ratio=event.volume_ratio,
             trigger_type=event.trigger_type,
+            window_vwap=event.window_vwap,
         )
 
         # --- pre-market check ---
@@ -185,6 +191,38 @@ async def _process_trigger(
             )
             return
 
+        # Hard confidence gate. Gemini occasionally sets should_trade=True with
+        # confidence below MIN_GEMINI_CONFIDENCE; enforce the floor bot-side.
+        # Earnings catalysts use a lower floor (MIN_GEMINI_CONFIDENCE_EARNINGS):
+        # earnings beats/misses are well-sourced and the directional move is
+        # unambiguous, so requiring the same confidence as a speculative micro-cap
+        # squeeze understates a real signal.
+        conf_threshold = (
+            config.MIN_GEMINI_CONFIDENCE_EARNINGS
+            if event.is_earnings
+            else config.MIN_GEMINI_CONFIDENCE
+        )
+        if verdict.confidence < conf_threshold:
+            log.info(
+                "[CONF GATE] %s skipped — confidence %d < threshold %d%s",
+                event.ticker, verdict.confidence, conf_threshold,
+                " (earnings)" if event.is_earnings else "",
+            )
+            return
+
+        # Hard RSI ceiling gate. Gemini's system prompt says RSI > 85 →
+        # should_trade=False, but the model has been observed entering
+        # severely overbought names anyway (INTC RSI 86 on 2026-05-07).
+        # Fail open when technicals are unavailable.
+        if (ctx.technicals is not None
+                and ctx.technicals.rsi is not None
+                and ctx.technicals.rsi > config.MAX_ENTRY_RSI):
+            log.info(
+                "[RSI GATE] %s skipped — RSI %.0f > MAX_ENTRY_RSI %d",
+                event.ticker, ctx.technicals.rsi, config.MAX_ENTRY_RSI,
+            )
+            return
+
         if is_premarket:
             log.info("[PRE-MARKET] %s passes thresholds; sending watch alert", event.ticker)
             try:
@@ -195,8 +233,65 @@ async def _process_trigger(
             await cooldown_store.set_cooldown(event.ticker)
             return
 
+        # --- Kronos secondary confirmation ---
+        # Reuses the trader's existing Alpaca historical data client to pull
+        # the last 60 one-minute bars and asks Kronos-mini whether the move
+        # is likely to continue. A below-threshold probability downgrades
+        # this Gemini buy to a skip (no cooldown set, so the next trigger
+        # for the same ticker is still eligible).
+        if config.USE_KRONOS:
+            kronos_df = None
+            try:
+                from alpaca.data.requests import StockBarsRequest
+                from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+                from alpaca.data.enums import DataFeed
+
+                hc = getattr(trader, "_hist_client", None)
+                if hc is not None:
+                    now_et = datetime.now(tz=config.MARKET_TZ)
+                    req = StockBarsRequest(
+                        symbol_or_symbols=event.ticker,
+                        timeframe=TimeFrame(1, TimeFrameUnit.Minute),
+                        start=now_et - timedelta(hours=4),
+                        feed=DataFeed.IEX,
+                    )
+                    raw = await asyncio.to_thread(hc.get_stock_bars, req)
+                    df_full = getattr(raw, "df", None)
+                    if df_full is not None and not df_full.empty:
+                        if hasattr(df_full.index, "names") and "symbol" in (df_full.index.names or []):
+                            try:
+                                df_full = df_full.xs(event.ticker, level="symbol")
+                            except KeyError:
+                                df_full = None
+                        if df_full is not None and not df_full.empty:
+                            cols = ["open", "high", "low", "close", "volume"]
+                            if all(c in df_full.columns for c in cols):
+                                kronos_df = df_full[cols].tail(60).astype(float)
+            except Exception:
+                log.warning(
+                    "[KRONOS] minute-bar fetch failed for %s; skipping Kronos check",
+                    event.ticker, exc_info=True,
+                )
+                kronos_df = None
+
+            if kronos_df is not None and len(kronos_df) > 0:
+                prob = await asyncio.to_thread(get_continuation_prob, kronos_df, 10)
+                if prob is not None:
+                    if prob < config.KRONOS_MIN_PROB:
+                        log.info(
+                            "[KRONOS] %s continuation_prob=%.2f below threshold %.2f "
+                            "— downgrading buy to skip",
+                            event.ticker, prob, config.KRONOS_MIN_PROB,
+                        )
+                        return
+                    log.info(
+                        "[KRONOS] %s continuation_prob=%.2f confirmed",
+                        event.ticker, prob,
+                    )
+
         stats.alerts_sent += 1
         sector = determine_sector(event.ticker, news)
+        current_regime = getattr(scorer, "_current_regime_label", "unknown")
         bought = False
         try:
             bought = await trader.execute_auto_buy(
@@ -206,6 +301,7 @@ async def _process_trigger(
                 is_biotech=biotech,
                 sector=sector,
                 quant_signals=quant,
+                regime=current_regime,
             )
         except Exception:
             log.exception("execute_auto_buy failed for %s", event.ticker)
@@ -238,6 +334,9 @@ async def pipeline_consumer(
 ) -> None:
     """Drain trigger queue; process up to PIPELINE_CONCURRENCY events concurrently."""
     sem = asyncio.Semaphore(config.PIPELINE_CONCURRENCY)
+    # Strong refs for in-flight pipeline tasks — asyncio only weak-refs them,
+    # and a dropped trigger is a missed trade.
+    pending: set[asyncio.Task] = set()
 
     async def bounded(event: TriggerEvent) -> None:
         async with sem:
@@ -254,7 +353,9 @@ async def pipeline_consumer(
             log.info("[CIRCUIT BREAKER] halted; dropping trigger for %s", event.ticker)
             continue
         stats.spikes_detected += 1
-        asyncio.create_task(bounded(event))
+        task = asyncio.create_task(bounded(event))
+        pending.add(task)
+        task.add_done_callback(pending.discard)
 
 
 async def run_heartbeat(
@@ -312,6 +413,45 @@ async def run_regime_refresher(
             scorer._current_regime_label = label
         except Exception:
             log.warning("regime refresh failed; keeping previous label", exc_info=True)
+
+
+async def run_nightly_self_improvement(scorer: Scorer, stop_event: asyncio.Event) -> None:
+    """Run self-improvement once per day at 4:30 PM ET, after EOD close completes.
+
+    EOD close fires at config.EOD_CLOSE_HOUR:EOD_CLOSE_MINUTE (default 15:45 ET);
+    we schedule for 16:30 ET so all sell fills have settled and trade_log.jsonl
+    is up to date for the day. The analysis itself self-skips on weekends and
+    holidays via the trade-count floor inside run_nightly_analysis().
+
+    The scorer is passed through so the Gemini call is routed through the same
+    monthly budget gate, RPM limiter, and call counters as scoring traffic.
+    """
+    target_hour, target_minute = 16, 30
+    while not stop_event.is_set():
+        now_et = datetime.now(tz=config.MARKET_TZ)
+        target = now_et.replace(
+            hour=target_hour, minute=target_minute, second=0, microsecond=0
+        )
+        if target <= now_et:
+            target += timedelta(days=1)
+        wait = (target - now_et).total_seconds()
+        log.info("next self-improvement run in %.0f seconds", wait)
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=wait)
+            return
+        except asyncio.TimeoutError:
+            pass
+
+        # Skip weekends — naturally also handled by the trade-count floor,
+        # but skipping the Gemini call entirely on Sat/Sun saves ~$0.002/day.
+        weekday = datetime.now(tz=config.MARKET_TZ).weekday()
+        if weekday >= 5:
+            log.info("[self_improvement] weekend; skipping nightly run")
+            continue
+        try:
+            await run_nightly_analysis(scorer)
+        except Exception:
+            log.exception("nightly self-improvement raised; continuing")
 
 
 async def _supervise(
@@ -381,17 +521,29 @@ async def _startup_checks(
     except Exception as e:
         log.error("❌ Alpaca unreachable: %s", e)
 
-    # Gemini API key — minimal generate call to confirm auth
-    try:
-        from google.genai import types as _genai_types
-        await scorer._client.aio.models.generate_content(
-            model="gemini-2.5-flash",
-            contents="ping",
-            config=_genai_types.GenerateContentConfig(max_output_tokens=1),
+    # Gemini API key — minimal generate call to confirm auth.
+    # Uses the cheap verdict model and routes through the scorer's monthly
+    # cost tracker so the ping doesn't bypass the budget cap.
+    if getattr(scorer, "_budget_mode", "normal") == "halted":
+        log.warning(
+            "⚠️ Gemini ping skipped — monthly budget halted; assuming key valid"
         )
-        log.info("✅ Gemini API key valid")
-    except Exception as e:
-        log.error("❌ Gemini API key check failed: %s", e)
+    else:
+        try:
+            from google.genai import types as _genai_types
+            if not scorer._record_call_cost(is_grounded=False):
+                log.warning(
+                    "⚠️ Gemini ping skipped — budget gate refused the call"
+                )
+            else:
+                await scorer._client.aio.models.generate_content(
+                    model=config.GEMINI_MODEL_VERDICT,
+                    contents="ping",
+                    config=_genai_types.GenerateContentConfig(max_output_tokens=1),
+                )
+                log.info("✅ Gemini API key valid")
+        except Exception as e:
+            log.error("❌ Gemini API key check failed: %s", e)
 
     # Telegram bot token — getMe
     # Token is embedded in the URL; never log the raw URL or unredacted exception
@@ -425,6 +577,11 @@ async def _inject_synthetic(queue: asyncio.Queue[TriggerEvent], spec: list[str])
         raise ValueError(
             f"--inject-trigger: PRICE/MOVE_PCT/VOL_RATIO must be numeric ({exc})"
         ) from exc
+    # NaN/inf bypass the bounds checks below because NaN comparisons return
+    # False. Reject them explicitly — same guard as trader._do_execute_buy.
+    for name, val in (("PRICE", price), ("MOVE_PCT", move), ("VOL_RATIO", vol)):
+        if not math.isfinite(val):
+            raise ValueError(f"--inject-trigger: {name} must be finite (got {val})")
     if price <= 0:
         raise ValueError(f"--inject-trigger: PRICE must be positive (got {price})")
     if not -0.99 < move < 5.0:
@@ -587,10 +744,34 @@ async def main() -> int:
     cooldown_store = CooldownStore()
     await cooldown_store.load()
 
+    # Post-trade reflection store + generator. Loaded once at startup; the
+    # generator is wired onto the trader so close paths can fire it as a
+    # background task. The store is wired onto the scorer so the verdict
+    # prompt can inject PRIOR LESSONS.
+    reflection_store = ReflectionStore()
+    if config.REFLECTION_ENABLED:
+        await reflection_store.load()
+        try:
+            dropped = await reflection_store.prune(
+                older_than_days=config.REFLECTION_PRUNE_DAYS,
+            )
+            if dropped:
+                log.info("reflection store: pruned %d entries at startup", dropped)
+        except Exception:
+            log.warning("reflection store prune failed at startup", exc_info=True)
+    reflection_generator = ReflectionGenerator(
+        store=reflection_store, scorer=scorer, hist_client=hist_client,
+    )
+
     # Wire Gemini budget alerts to Telegram. Scorer fires this from
     # _record_call_cost when budget mode transitions (80% / 100%).
+    # Strong-ref the task: asyncio loop only holds weak refs and the budget
+    # transition message could otherwise be GC'd before delivery.
+    _alert_tasks: set[asyncio.Task] = set()
     def _budget_alert(msg: str) -> None:
-        asyncio.create_task(telegram.send_message(msg))
+        task = asyncio.create_task(telegram.send_message(msg))
+        _alert_tasks.add(task)
+        task.add_done_callback(_alert_tasks.discard)
     scorer._alert_callback = _budget_alert
 
     regime_detector = MarketRegimeDetector(hist_client=hist_client)
@@ -599,6 +780,10 @@ async def main() -> int:
         cooldown_store=cooldown_store, hist_client=hist_client,
         regime_detector=regime_detector,
     )
+    # Wire reflection plumbing now that both trader and scorer exist.
+    if config.REFLECTION_ENABLED:
+        scorer._reflection_store = reflection_store
+        trader._reflection_generator = reflection_generator
     telegram.set_context(
         trader=trader,
         stats=stats,
@@ -608,6 +793,7 @@ async def main() -> int:
             "adv_prefetched": len(adv),
             "ws_subscribed": len(watchlist),
         },
+        regime_detector=regime_detector,
     )
 
     trigger_queue: asyncio.Queue[TriggerEvent] = asyncio.Queue()
@@ -718,6 +904,11 @@ async def main() -> int:
         tasks.append(_supervise(
             "run_regime_refresher",
             lambda: run_regime_refresher(regime_detector, scorer, stop_event),
+            stop_event,
+        ))
+        tasks.append(_supervise(
+            "run_nightly_self_improvement",
+            lambda: run_nightly_self_improvement(scorer, stop_event),
             stop_event,
         ))
         try:

@@ -136,6 +136,11 @@ async def get_reddit_sentiment(ticker: str) -> dict:
         return {}
 
     _cache[ticker] = (now, data)
+    # Prune entries past TTL so the cache doesn't grow unbounded across the
+    # bot's full session (other quant-signal caches do the same).
+    stale = [k for k, (t, _) in _cache.items() if now - t >= _CACHE_SECONDS]
+    for k in stale:
+        del _cache[k]
     log.info(
         "reddit sentiment %s: mentions=%s score=%s top='%s'",
         ticker,

@@ -99,6 +99,8 @@ POSITION_SIZE_PCT = _float("POSITION_SIZE_PCT", 0.10)
 # so existing .env files don't error, but it is no longer read by any code path.
 TAKE_PROFIT_PCT = _float("TAKE_PROFIT_PCT", 0.15)
 STOP_LOSS_PCT = _float("STOP_LOSS_PCT", 0.05)        # fixed hard floor; never dynamic
+NEAR_TP_EXIT_PCT   = _float("NEAR_TP_EXIT_PCT", 0.01)   # close when within 1% of TP
+NEAR_TP_MIN_HOLD_MINUTES = _int("NEAR_TP_MIN_HOLD_MINUTES", 20)  # must hold at least this long first
 MAX_POSITIONS = _int("MAX_POSITIONS", 5)
 
 # --- Dynamic take-profit magnitude tiers ---
@@ -125,7 +127,15 @@ STALE_TRIGGER_MINUTES = _int("STALE_TRIGGER_MINUTES", 5)
 STALE_TRIGGER_REVERSAL_PCT = _float("STALE_TRIGGER_REVERSAL_PCT", 0.03)
 
 MIN_GEMINI_CONFIDENCE = _int("MIN_GEMINI_CONFIDENCE", 7)
+MIN_GEMINI_CONFIDENCE_EARNINGS = _int("MIN_GEMINI_CONFIDENCE_EARNINGS", 6)
 MIN_GEMINI_MAGNITUDE = _int("MIN_GEMINI_MAGNITUDE", 7)
+
+# Hard RSI ceiling: bot rejects entries when technicals report RSI above
+# this value, regardless of Gemini's verdict. Gemini's system prompt already
+# says RSI > 85 → should_trade=False, but the model has been observed
+# overriding its own rule, so this is a bot-side floor. Fail open when
+# technicals are unavailable.
+MAX_ENTRY_RSI = _int("MAX_ENTRY_RSI", 82)
 
 # --- Biotech catalyst fast-track ---
 # Raised from 4→6 to guard against binary FDA gap risk: rejection/CRL can
@@ -186,6 +196,13 @@ GEMINI_SIZE_MAX = _float("GEMINI_SIZE_MAX", 0.12)
 GEMINI_HOLD_MIN = _int("GEMINI_HOLD_MIN", 30)
 GEMINI_HOLD_MAX = _int("GEMINI_HOLD_MAX", 390)
 
+# ATR-anchored stop-loss floor. After clamping Gemini's stop_loss_pct, the
+# trader enforces a minimum stop distance of ATR_SL_MULTIPLIER × daily ATR%
+# so a routine intraday wiggle doesn't stop the trade out. Capped at
+# GEMINI_SL_MAX so a very-volatile name doesn't end up with a wider-than-ceiling
+# stop.
+ATR_SL_MULTIPLIER = _float("ATR_SL_MULTIPLIER", 0.5)
+
 # --- Concurrency / rate limiting ---
 GEMINI_CONCURRENCY = _int("GEMINI_CONCURRENCY", 2)
 PIPELINE_CONCURRENCY = _int("PIPELINE_CONCURRENCY", 3)
@@ -195,6 +212,11 @@ VERDICT_CACHE_MINUTES = _int("VERDICT_CACHE_MINUTES", 30)
 POSITION_EVAL_INTERVAL_MINUTES = _int("POSITION_EVAL_INTERVAL_MINUTES", 15)
 POSITION_EVAL_MIN_HOLD_MINUTES = _int("POSITION_EVAL_MIN_HOLD_MINUTES", 10)
 POSITION_EVAL_SEMAPHORE_LIMIT  = _int("POSITION_EVAL_SEMAPHORE_LIMIT",  2)
+# Force a Gemini re-eval whenever an open position's unrealized P&L drops
+# below -FORCED_REEVAL_LOSS_PCT, bypassing the news-fingerprint skip. A
+# bleeding position should always get a fresh look even when no new headlines
+# have appeared.
+FORCED_REEVAL_LOSS_PCT = _float("FORCED_REEVAL_LOSS_PCT", 0.015)
 
 # --- Micro-cap screener ---
 MICROCAP_ENABLED = _bool("MICROCAP_ENABLED", True)
@@ -248,6 +270,16 @@ GEMINI_MODEL_VERDICT = os.getenv(
     "GEMINI_MODEL_VERDICT", "gemini-2.5-flash-lite"
 )
 
+# --- Kronos secondary confirmation ---
+# When enabled, after a Gemini buy verdict has cleared all gates, fetch the
+# last 60 one-minute bars and ask Kronos-mini for a short-horizon continuation
+# probability. If the fraction of predicted closes above the last known close
+# is below KRONOS_MIN_PROB, the buy is downgraded to a skip (no cooldown).
+# Failure-modes (model unavailable, fetch error, inference None) fall through
+# silently and the trade proceeds on the Gemini verdict alone.
+USE_KRONOS      = _bool("USE_KRONOS", True)
+KRONOS_MIN_PROB = _float("KRONOS_MIN_PROB", 0.45)
+
 # --- Gemini monthly budget cap ---
 # When monthly_cost_estimate hits 80% of MONTHLY_GEMINI_BUDGET_USD, the scorer
 # switches to ungrounded-only (skips the Google Search research call). At 100%
@@ -256,3 +288,16 @@ GEMINI_MODEL_VERDICT = os.getenv(
 MONTHLY_GEMINI_BUDGET_USD       = _float("MONTHLY_GEMINI_BUDGET_USD", 30.0)
 GEMINI_COST_PER_GROUNDED_CALL   = _float("GEMINI_COST_PER_GROUNDED_CALL", 0.016)
 GEMINI_COST_PER_UNGROUNDED_CALL = _float("GEMINI_COST_PER_UNGROUNDED_CALL", 0.002)
+
+# --- Post-trade reflection loop ---
+# After each trade closes, a one-paragraph reflection is generated via Gemini
+# and persisted to state/reflections.jsonl. On the next entry decision for
+# the same ticker, the most recent reflections are injected into the verdict
+# prompt as PRIOR LESSONS so the bot learns from prior wins/losses on that name.
+# Reflection generation runs in the background — the close path never awaits it.
+REFLECTION_ENABLED                  = _bool("REFLECTION_ENABLED", True)
+REFLECTION_MODEL                    = os.getenv("REFLECTION_MODEL", GEMINI_MODEL_VERDICT)
+REFLECTION_PRUNE_DAYS               = _int("REFLECTION_PRUNE_DAYS", 180)
+REFLECTION_MAX_PER_TICKER_INJECTED  = _int("REFLECTION_MAX_PER_TICKER_INJECTED", 3)
+REFLECTION_MAX_GLOBAL_INJECTED      = _int("REFLECTION_MAX_GLOBAL_INJECTED", 5)
+REFLECTION_INJECTED_TOKEN_BUDGET    = _int("REFLECTION_INJECTED_TOKEN_BUDGET", 600)

@@ -5,13 +5,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 ```bash
-# Syntax-check every file (no test suite — this is the primary correctness check)
+# Syntax-check every file (run on every file you touch before declaring work done)
 python3 -m py_compile bot.py stream.py news.py scorer.py technicals.py trader.py \
     telegram_handler.py daily_summary.py microcap_screener.py market_calendar.py \
     earnings_calendar.py config.py logger.py cooldown_store.py http_utils.py \
     position_monitor.py build_watchlist.py build_catalyst_watchlist.py \
     fundamentals.py finnhub_data.py reddit_sentiment.py premarket_scanner.py \
     short_interest.py estimate_revisions.py sector_momentum.py market_regime.py
+
+# Run unit tests (21 tests covering pure functions — added 2026-05-07 third session)
+python -m pytest tests/ -v
 
 # End-to-end pipeline test (works outside market hours; skips real stream)
 python bot.py --inject-trigger AAPL 180.0 0.12 7.0
@@ -46,7 +49,7 @@ ssh aso@192.168.1.183 "cat ~/trading-bot/state/trade_log.jsonl"
 ssh aso@192.168.1.183 "cat ~/trading-bot/state/open_positions.json"
 ```
 
-All config is in `.env` (see `.env.example`). `python3 -m py_compile` is the only automated check — run it on every file you touch before considering work done.
+All config is in `.env` (see `.env.example`). Two automated checks: `python3 -m py_compile` (syntax) and `python -m pytest tests/` (21 unit tests over pure functions). Run both on any change before considering work done.
 
 ---
 
@@ -74,6 +77,7 @@ Alpaca WebSocket (stream.py TriggerDetector)
     → asyncio.Queue[TriggerEvent]  (cross-loop via call_soon_threadsafe)
     → pipeline_consumer (bot.py)
         → fetch_news → scorer.score (2 Gemini calls)
+        → kronos_scorer.get_continuation_prob (optional gate)
         → trader.execute_auto_buy
 ```
 
@@ -125,17 +129,29 @@ Three new modules feed signals into the Gemini verdict prompt before entry and r
 
 All four are fetched via `asyncio.gather()` inside `scorer.score()` and `score_open_position()`. All fail open — if unavailable, their line is silently omitted from the Gemini prompt. Sector momentum is fetched serially after the gather because it needs `fundamentals.sector` first.
 
+### Kronos secondary confirmation (kronos_scorer.py)
+
+After Gemini approves a buy but before `execute_auto_buy` submits the order, `bot._process_trigger` calls `kronos_scorer.get_continuation_prob()` if `USE_KRONOS=true` (default). This loads NeoQuasar's Kronos-mini model lazily from `/home/aso/Kronos`, runs an inference over the last 60 one-minute bars (fetched via the trader's existing Alpaca historical data client), and returns the fraction of the next 10 predicted bars that close above the current price.
+
+If the probability is below `KRONOS_MIN_PROB` (default 0.45), the buy is downgraded to a skip — no order is submitted, but no cooldown is set so the next trigger for the same ticker is still eligible. If the probability is at or above the threshold, the buy proceeds normally.
+
+Fail-open: every error path (model not loaded, frequency inference failure, inference exception, fewer than 20 input bars, missing OHLCV columns) returns `None` and the gate is bypassed. Set `USE_KRONOS=false` in `.env` to disable the model entirely (skips the lazy import too — useful when `/home/aso/Kronos` isn't checked out).
+
 ### Active position monitoring (position_monitor.py)
 
-Re-evaluates every open position with Gemini every 15 minutes. For each position:
+Re-evaluates every open position with Gemini every `POSITION_EVAL_INTERVAL_MINUTES` (default 15min). For each position:
 - Fetches fresh news since entry
 - Fetches updated technicals
 - Gets current price from Alpaca
-- Calls `scorer.score_open_position()` which returns: `hold`, `exit`, or `raise_target`
-- On `exit` → calls `trader._close_position()` with reason `"gemini_exit"`
-- On `raise_target` → updates `pos.take_profit_pct` and sends Telegram notification
+- Calls `scorer.score_open_position()` which returns one of six actions: `hold`, `exit`, `raise_target`, `tighten_sl`, `adjust_tp`, `add_time`
+- On `exit` → calls `trader._close_position()` with reason `"gemini_exit — <reason>"`
+- On `raise_target` → updates `pos.take_profit_pct` (must exceed current TP) and sends Telegram notification
+- On `tighten_sl` → raises `pos.sl_floor` to lock in gains (must exceed current floor)
+- On `adjust_tp` → revises `pos.take_profit_pct` (clamped to GEMINI_TP_MIN/MAX, can be raised or lowered)
+- On `add_time` → extends `pos.max_hold_minutes` (capped at GEMINI_HOLD_MAX)
 - On `hold` → logs at DEBUG, no Telegram message
-- Never evaluates positions younger than 10 minutes
+- Never evaluates positions younger than `POSITION_EVAL_MIN_HOLD_MINUTES` (default 10min)
+- Bypasses the news-fingerprint skip when current P&L is below `-FORCED_REEVAL_LOSS_PCT` (default −1.5%)
 - Uses `_position_sem` (limit 2) — never blocks new entry scoring
 
 ### Close / P&L accounting flow (trader.py)
@@ -149,6 +165,14 @@ TradingStream SELL fill event → _handle_sell_fill → P&L, TradeRecord, trade_
 ```
 
 `_closing_in_progress: set[str]` prevents duplicate close orders across monitor ticks. On Alpaca error `40310000` ("insufficient qty available") a close order is already pending — the bot stays in `_closing_in_progress` and waits for the fill event rather than retrying.
+
+### Nightly self-improvement (self_improvement.py)
+
+Runs once per trading day at 4:30 PM ET via `run_nightly_self_improvement` in `bot.py`, after EOD close completes (15:45 ET) so all sell fills have settled. Reads `state/trade_log.jsonl`, computes coarse win-rate stats grouped by exit reason, Gemini confidence, Gemini magnitude, and `technical_signal`, then asks Gemini (one verdict call, routed through `Scorer._record_call_cost` so it counts toward the monthly budget) to extract patterns and produce a structured insights JSON.
+
+Output goes to `state/insights.json`. The top of `scorer.score()` loads this file on every entry call (if present and `< INSIGHTS_FRESH_DAYS = 7` days old) and appends the lessons / favor_patterns / avoid_patterns to the verdict prompt, so Gemini learns from what has actually worked and failed in this account.
+
+Self-skips on weekends and when fewer than `MIN_TRADES_FOR_ANALYSIS = 5` trades exist in the log. Any failure (file missing, JSON parse error, Gemini call failure) logs a warning and returns silently — never crashes the bot. Routes through the same monthly budget gate, so when the bot is `halted` the nightly call is skipped just like scoring traffic.
 
 ### Watchlist tiers
 
@@ -181,13 +205,13 @@ TradingStream SELL fill event → _handle_sell_fill → P&L, TradeRecord, trade_
 
 **Gap-open trigger** — at 9:30 ET (±`GAP_OPEN_WINDOW_MINUTES`), if first bar's open price is ≥ `GAP_OPEN_THRESHOLD` (15%) above the previous session close, emits a `TriggerEvent(trigger_type="gap_open")`. Fires once per ticker per session. Previous close prefetched at startup via `prefetch_prev_close()`.
 
-**Position re-evaluation** — `position_monitor.py` wakes every 10 minutes and can now return 6 actions: `hold`, `exit`, `raise_target`, `tighten_sl` (raise SL floor to lock in gains), `adjust_tp` (raise or lower TP), `add_time` (extend hold window). The `sl_floor` field on `ActivePosition` tracks the current stop floor and can be raised above zero by `tighten_sl`.
+**Position re-evaluation** — `position_monitor.py` wakes every `POSITION_EVAL_INTERVAL_MINUTES` (default 15min) and can return 6 actions: `hold`, `exit`, `raise_target`, `tighten_sl` (raise SL floor to lock in gains), `adjust_tp` (raise or lower TP), `add_time` (extend hold window). The `sl_floor` field on `ActivePosition` tracks the current stop floor and can be raised above zero by `tighten_sl`.
 
 **Circuit breaker** (`SessionStats.halt_new_entries`) is checked in `pipeline_consumer` and `microcap_screener._evaluate` before every entry. It trips when `realized_pnl ≤ -(DAILY_LOSS_LIMIT_PCT × opening_equity)`. It resets at 4:05 PM ET via `run_daily_summary`.
 
 **Entry retrace guard** — before submitting a buy, fetches current price and skips if less than 60% of the original move remains (`ENTRY_RETRACE_THRESHOLD`).
 
-**Hold timeout** — only fires when the position is profitable (`plpc >= 0`). Losing positions are never forced out by the clock — the SL floor or EOD close handles them.
+**Hold timeout** — only fires when the position is profitable (`plpc >= 0.001`, ~10 bps; the strict-positive threshold avoids float-precision races where Alpaca returns 0.0 at the tick instant and the SELL fills slightly negative). When it fires, the deadline is pushed 30 minutes out and a `_timeout_reeval` task routes through the same Gemini-driven path as the regular monitor (hold / exit / raise_target / tighten_sl / adjust_tp / add_time). If the Gemini call fails, fallback closes profitable positions only with reason `timeout_fallback — review unavailable`. Losing positions are never forced out by the clock — the SL floor or EOD close handles them.
 
 **All external HTTP calls** must go through `http_utils.fetch_with_retry`. Never use raw `session.get` outside of the specific one-shot price check helpers.
 
@@ -212,13 +236,16 @@ TradingStream SELL fill event → _handle_sell_fill → P&L, TradeRecord, trade_
 | GAP_OPEN_THRESHOLD | 15% | Min gap vs prev close to fire gap-open trigger |
 | GAP_OPEN_WINDOW_MINUTES | 2 | Window after 9:30 ET to detect gaps |
 | OPENING_BELL_MINUTES | 3 | Suppress intraday triggers at open (gap-open bypasses this) |
+| MAX_ENTRY_RSI | 82 | Bot-side hard ceiling on RSI for entries (rejects regardless of Gemini verdict) |
 | MAX_POSITIONS | 5 | Max concurrent positions |
 | DAILY_LOSS_LIMIT_PCT | 2% | Circuit breaker threshold |
 | ENTRY_RETRACE_THRESHOLD | 0.6 | Skip if 40%+ of move already retraced |
 | POSITION_EVAL_INTERVAL_MINUTES | 15 | Gemini re-eval frequency |
+| FORCED_REEVAL_LOSS_PCT | 1.5% | Bypass news-fingerprint skip and force a Gemini re-look when P&L drops below this |
 | **Gemini-driven limits (hard floors/ceilings)** | | |
 | GEMINI_TP_MIN / GEMINI_TP_MAX | 5% / 50% | Take-profit range Gemini can set |
 | GEMINI_SL_MIN / GEMINI_SL_MAX | 2% / 10% | Stop-loss range Gemini can set |
+| ATR_SL_MULTIPLIER | 0.5 | SL must cover at least this × daily ATR%; capped at GEMINI_SL_MAX |
 | GEMINI_SIZE_MIN / GEMINI_SIZE_MAX | 2% / 12% | Position size range Gemini can set |
 | GEMINI_HOLD_MIN / GEMINI_HOLD_MAX | 30 / 390min | Hold time range Gemini can set |
 | SHORT_INTEREST_CACHE_HOURS | 4h | yfinance short interest cache TTL |
@@ -229,6 +256,9 @@ TradingStream SELL fill event → _handle_sell_fill → P&L, TradeRecord, trade_
 | MONTHLY_GEMINI_BUDGET_USD | 30.0 | Monthly Gemini hard cost cap |
 | GEMINI_COST_PER_GROUNDED_CALL | 0.016 | Cost charged per grounded call |
 | GEMINI_COST_PER_UNGROUNDED_CALL | 0.002 | Cost charged per ungrounded call |
+| **Kronos secondary confirmation** | | |
+| USE_KRONOS | true | Toggle Kronos-mini gate after Gemini buy approval; false skips the lazy import |
+| KRONOS_MIN_PROB | 0.45 | Minimum continuation probability to allow the buy through |
 
 `config._required()` raises `RuntimeError` at import time for missing secrets — the bot will not start without valid Alpaca, Gemini, and Telegram credentials. `ALPACA_PAPER=true` must be set for paper trading; flipping to `false` routes real orders.
 
@@ -245,29 +275,52 @@ TradingStream SELL fill event → _handle_sell_fill → P&L, TradeRecord, trade_
 
 ## MCP Tools & Plugins — MANDATORY USAGE RULES
 
-These are not optional. Claude MUST follow these rules on every task, no exceptions:
+These are not optional. Claude MUST follow these rules on every task, no exceptions.
 
-### Before writing ANY code:
-1. If the code touches alpaca-py, google-genai, aiohttp, finnhub-python, or tenacity — use Context7 FIRST to verify current API syntax. Do not rely on training data.
-2. If you need to check a live URL, scrape docs, or verify an endpoint is still active — use Firecrawl.
-3. After using Context7 or Firecrawl, explicitly state what you found before writing code.
+### Available MCP servers
 
-### Verification checklist (run before marking any task done):
+- **Context7** (HTTP transport at `mcp.context7.com` + a plugin-bundled variant) — current docs for any library. Use FIRST whenever code touches: alpaca-py, google-genai, aiohttp, finnhub-python, hmmlearn, yfinance, praw, python-telegram-bot, or any other SDK in `requirements.txt`. Invoke: "use context7 to find current docs for [library]"
+- **Web search** — fallback when Context7 doesn't have what's needed (current market structure, regulatory changes, breaking news, SDK migration notices not yet indexed in published docs).
+
+There is no Firecrawl in this setup — earlier versions of this file referenced it; ignore those references. There is no GitHub MCP either; commits, tags, and pushes are done manually after each session. XcodeBuildMCP is registered globally but does not apply to this repo (Python only, no Xcode).
+
+### Available plugins
+
+Two plugins load via `--plugin-dir` at session launch:
+
+- **agent-skills** at `~/projects/agent-skills` — 21 named skills + 3 specialized agents (code-reviewer, security-auditor, test-engineer).
+- **ruflo** at `~/projects/ruflo` — ~30 domain-specific sub-plugins.
+
+Skill names matter. Reference them by exact name in prompts when applicable.
+
+### Skills most relevant to this repo
+
+| When working on… | Use skill | Use agent |
+|---|---|---|
+| Anything touching secrets, HMAC, .env permissions, external API auth | `security-and-hardening` | `security-auditor` |
+| Live-log triage, bot crashes, fill-event accounting gaps, ghost-position recovery | `debugging-and-error-recovery` | — |
+| Stream/scorer/microcap hot paths, cache eviction, async concurrency tuning | `performance-optimization` | — |
+| Adding tests to `tests/test_core.py` (pure functions only — no mocks, no live calls) | `test-driven-development` | `test-engineer` |
+| Retiring an old API surface, env var, or behavior (e.g., the heartbeat URL rename) | `deprecation-and-migration` | — |
+| Multi-phase changes — ship one step at a time, verify, move on | `incremental-implementation` | — |
+| Final review of every changed file before declaring work done | `code-review-and-quality` | `code-reviewer` |
+| Breaking down a vague feature request before any code is written | `planning-and-task-breakdown` | — |
+
+For ruflo plugins, only invoke one when the task name explicitly maps to its sub-plugin name (e.g., ruflo-cost-tracker for Gemini budget work, ruflo-observability for journal/log changes, ruflo-market-data for Alpaca/yfinance/Finnhub fetch refactors). Do not fan out across many at once.
+
+### Before writing ANY code
+
+1. If the code touches a third-party SDK, use Context7 FIRST to verify current API syntax. Do not rely on training data.
+2. After consulting Context7, explicitly state what you found before writing code.
+3. Identify which agent-skills skill applies (table above) and invoke it.
+
+### Verification checklist (run before marking any task done)
+
 - [ ] Did I use Context7 for any SDK/library calls?
-- [ ] Did I py_compile every file I touched?
-- [ ] Did I verify no blocking I/O in async functions?
-- [ ] Did I check for race conditions on shared state?
+- [ ] Did I run `python3 -m py_compile` on every file I touched?
+- [ ] Did I run `python -m pytest tests/ -v` if my change could affect any function covered by the suite?
+- [ ] Did I verify no blocking I/O in async functions (Alpaca SDK calls, file I/O on hot paths)?
+- [ ] Did I check for race conditions on shared state (`_closing_in_progress`, `_close_fallback_tasks`, cooldown dicts)?
+- [ ] Did I run `code-review-and-quality` on every changed file?
 
-### Available tools:
-
-- **Context7** — look up current docs before writing any code touching:
-  alpaca-py, google-genai, aiohttp, finnhub-python, tenacity, hmmlearn.
-  Prevents use of deprecated or renamed API methods.
-  Invoke: "use context7 to find current docs for [library]"
-
-- **Firecrawl** — use for scraping live URLs, verifying API endpoints are still active,
-  researching news sources, or checking current library changelogs.
-  Invoke: "use firecrawl to scrape [url]"
-
-NEVER guess at API syntax. NEVER skip py_compile.
-NEVER use training data alone for any Alpaca, Gemini, or Finnhub API calls.
+NEVER guess at API syntax. NEVER skip py_compile. NEVER use training data alone for any Alpaca, Gemini, Finnhub, or yfinance API calls.

@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import numpy as np
 from alpaca.data.enums import DataFeed
@@ -53,7 +53,7 @@ class MarketRegimeDetector:
         and returns it (or "unknown" if the cache is empty).
         """
         if self._last_updated is not None:
-            age = (datetime.utcnow() - self._last_updated).total_seconds() / 60.0
+            age = (datetime.now(timezone.utc) - self._last_updated).total_seconds() / 60.0
             if age < self._cache_minutes:
                 return self._current_regime
 
@@ -61,7 +61,7 @@ class MarketRegimeDetector:
             # Double-check after acquiring the lock — another waiter may have
             # just refreshed.
             if self._last_updated is not None:
-                age = (datetime.utcnow() - self._last_updated).total_seconds() / 60.0
+                age = (datetime.now(timezone.utc) - self._last_updated).total_seconds() / 60.0
                 if age < self._cache_minutes:
                     return self._current_regime
             try:
@@ -160,7 +160,7 @@ class MarketRegimeDetector:
             current_label = label_map[int(states[-1])]
 
             self._current_regime = current_label
-            self._last_updated = datetime.utcnow()
+            self._last_updated = datetime.now(timezone.utc)
             log.info("[REGIME] SPY regime: %s", current_label)
         except Exception:
             log.warning("[REGIME] update failed; leaving previous label", exc_info=True)

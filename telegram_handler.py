@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -29,6 +30,19 @@ from scorer import CatalystVerdict, TriggerContext
 log = logging.getLogger("telegram")
 
 _MARKET_TZ = ZoneInfo("America/New_York")
+
+
+def _redact(text: str) -> str:
+    """Strip the Telegram bot token from arbitrary text.
+
+    The python-telegram-bot client embeds the token in every Bot API URL,
+    so any HTTP-related exception (httpx.HTTPError, request URLs in
+    error chains, etc.) can leak it through __str__/__repr__. Call this
+    on any string before logging when the source might include URL text.
+    """
+    if not config.TELEGRAM_BOT_TOKEN:
+        return text
+    return text.replace(config.TELEGRAM_BOT_TOKEN, "<TELEGRAM_BOT_TOKEN>")
 
 
 def _hold_str(secs: float) -> str:
@@ -52,16 +66,27 @@ class TelegramHandler:
         self._app.add_handler(CommandHandler("close", self._on_close))
         self._app.add_handler(CommandHandler("watchlist", self._on_watchlist))
         self._app.add_handler(CommandHandler("trades", self._on_trades))
+        self._app.add_handler(CommandHandler("regime", self._on_regime))
+        self._app.add_handler(CommandHandler("perf", self._on_perf))
         # injected after construction via set_context()
         self._trader: Any = None
         self._stats: Any = None
         self._bot_start_utc: datetime | None = None
         self._watchlist_info: dict | None = None
+        self._regime_detector: Any = None
 
-    def set_context(self, *, trader: Any, stats: Any, watchlist_info: dict | None = None) -> None:
+    def set_context(
+        self,
+        *,
+        trader: Any,
+        stats: Any,
+        watchlist_info: dict | None = None,
+        regime_detector: Any = None,
+    ) -> None:
         self._trader = trader
         self._stats = stats
         self._watchlist_info = watchlist_info
+        self._regime_detector = regime_detector
         self._bot_start_utc = datetime.now(timezone.utc)
 
     # --- lifecycle ---
@@ -79,8 +104,10 @@ class TelegramHandler:
                 await self._app.updater.stop()
             await self._app.stop()
             await self._app.shutdown()
-        except Exception:
-            log.exception("error during Telegram shutdown")
+        except Exception as e:
+            # Redact: PTB exceptions chain httpx errors whose __str__ includes
+            # the request URL — and the token sits in that URL.
+            log.error("error during Telegram shutdown: %s", _redact(repr(e)))
 
     # --- generic outbound ---
 
@@ -89,8 +116,10 @@ class TelegramHandler:
             await self._app.bot.send_message(
                 chat_id=self._chat_id, text=text, parse_mode=parse_mode
             )
-        except Exception:
-            log.exception("send_message failed")
+        except Exception as e:
+            # log.exception would dump a traceback containing the Bot API URL
+            # (which embeds the token). Redact and skip exc_info here.
+            log.error("send_message failed: %s", _redact(repr(e)))
 
     # --- trade status messages ---
 
@@ -250,8 +279,8 @@ class TelegramHandler:
         if update.effective_chat:
             try:
                 await update.effective_chat.send_message(text, parse_mode=ParseMode.HTML)
-            except Exception:
-                log.exception("reply failed")
+            except Exception as e:
+                log.error("reply failed: %s", _redact(repr(e)))
 
     # --- inbound command handlers ---
 
@@ -376,8 +405,10 @@ class TelegramHandler:
                     log.debug("trade log line parse failed", exc_info=True)
                     continue
             await self._reply(update, "\n".join(parts))
-        except Exception:
-            log.exception("/trades command failed")
+        except Exception as e:
+            # _reply makes an HTTP call; the caught exception may have come
+            # from there, so the URL (and token) might be in repr(e).
+            log.error("/trades command failed: %s", _redact(repr(e)))
             await self._reply(update, "Failed to read trade log.")
 
     async def _on_close(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -403,6 +434,117 @@ class TelegramHandler:
         await self._reply(update, f"Closing {ticker}…")
         try:
             await trader._close_position(ticker, reason="manual /close")
-        except Exception:
-            log.exception("/close failed for %s", ticker)
+        except Exception as e:
+            log.error("/close failed for %s: %s", ticker, _redact(repr(e)))
             await self._reply(update, f"❌ Close failed for {ticker}. Check logs.")
+
+    async def _on_regime(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._authorized(update):
+            return
+        det = self._regime_detector
+        if det is None:
+            await self._reply(update, "Regime detector not available.")
+            return
+        try:
+            adj = det.get_regime_adjustments()
+        except Exception:
+            log.exception("/regime failed")
+            await self._reply(update, "Failed to read regime state.")
+            return
+        last_updated = getattr(det, "_last_updated", None)
+        if last_updated is not None:
+            age_min = (datetime.now(timezone.utc) - last_updated).total_seconds() / 60.0
+            age_str = f"{age_min:.0f} min ago"
+        else:
+            age_str = "never (no successful refresh yet)"
+        text = (
+            "📊 <b>Market Regime (HMM/SPY)</b>\n"
+            f"Label: <b>{adj.get('label', 'unknown')}</b>\n"
+            f"Size multiplier: {adj.get('size_multiplier', 1.0):.2f}×\n"
+            f"Hold multiplier: {adj.get('hold_multiplier', 1.0):.2f}×\n"
+            f"Last refresh: {age_str}"
+        )
+        await self._reply(update, text)
+
+    async def _on_perf(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._authorized(update):
+            return
+        stats = self._stats
+        if stats is None:
+            await self._reply(update, "Stats not available.")
+            return
+
+        records = list(getattr(stats, "trade_records", []) or [])
+        total = len(records)
+        wins = sum(1 for r in records if r.pnl_dollars > 0)
+        losses = total - wins
+        win_rate = (wins / total) if total else 0.0
+        realized = sum(r.pnl_dollars for r in records)
+
+        lines: list[str] = ["📈 <b>Session Performance</b>"]
+        if total == 0:
+            lines.append("No trades closed today.")
+        else:
+            lines.append(
+                f"Trades: {total} ({wins}W / {losses}L) — "
+                f"Win rate: {win_rate:.0%}"
+            )
+            sign = "+" if realized >= 0 else ""
+            lines.append(f"Realized P&L: {sign}${realized:,.2f}")
+
+            # By catalyst type — pulled from the close `reason` is unreliable;
+            # the trader doesn't tag catalyst type on TradeRecord. Use the
+            # Gemini verdict's catalyst_type via the trade_log.jsonl file when
+            # available; fall back to grouping by close reason prefix otherwise.
+            by_reason: dict[str, list] = defaultdict(list)
+            for r in records:
+                bucket_key = r.reason.split(" ", 1)[0] if r.reason else "unknown"
+                by_reason[bucket_key].append(r)
+            if by_reason:
+                lines.append("\nBy exit reason:")
+                for label in sorted(by_reason):
+                    bucket = by_reason[label]
+                    bw = sum(1 for r in bucket if r.pnl_dollars > 0)
+                    avg_pct = sum(r.pnl_pct for r in bucket) / len(bucket)
+                    lines.append(
+                        f"  {label}: {len(bucket)} trades, "
+                        f"{(bw / len(bucket)):.0%} win, "
+                        f"avg {avg_pct:+.1%}"
+                    )
+
+        # Factor signals
+        traded = getattr(stats, "factor_signals_traded", 0)
+        correct = getattr(stats, "factor_signals_correct", 0)
+        squeeze = getattr(stats, "squeeze_setups_seen", 0)
+        ins_seen = getattr(stats, "insider_bullish_seen", 0)
+        rev_seen = getattr(stats, "revision_strong_seen", 0)
+        if traded or squeeze or ins_seen or rev_seen:
+            lines.append("")
+            if traded:
+                rate = (correct / traded) if traded else 0.0
+                lines.append(
+                    f"Factor signals: {traded} traded, "
+                    f"{correct} correct ({rate:.0%})"
+                )
+            lines.append(
+                f"Squeeze setups seen: {squeeze} | "
+                f"Insider bullish seen: {ins_seen} | "
+                f"Revision strong seen: {rev_seen}"
+            )
+
+        # By regime
+        if records:
+            by_regime: dict[str, list] = defaultdict(list)
+            for r in records:
+                by_regime[getattr(r, "regime", "unknown") or "unknown"].append(r)
+            if by_regime:
+                lines.append("\nBy regime:")
+                for label in sorted(by_regime):
+                    bucket = by_regime[label]
+                    bw = sum(1 for r in bucket if r.pnl_dollars > 0)
+                    lines.append(
+                        f"  {label}: {len(bucket)} trades, "
+                        f"{(bw / len(bucket)):.0%} win"
+                    )
+
+        await self._reply(update, "\n".join(lines))

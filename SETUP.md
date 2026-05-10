@@ -15,7 +15,7 @@ Everything below assumes a fresh Pi 5. If your Pi is already flashed, skip to [S
 4. Click the **gear icon** (or `Ctrl+Shift+X`) for advanced options:
    - Set hostname: `tradingpi` (or whatever you like)
    - Enable SSH: yes → "Use password authentication" (or paste a public key)
-   - Set username: `pi` — **don't change this**; the systemd unit expects it
+   - Set username: `aso` — **don't change this**; the systemd unit (`User=aso`, `WorkingDirectory=/home/aso/trading-bot`) expects it. To use a different username, edit `trading-bot.service` first.
    - Set password
    - Configure Wi-Fi: SSID + password + country
    - Set locale/timezone (safe to use your local tz — we handle market tz in code)
@@ -24,7 +24,7 @@ Everything below assumes a fresh Pi 5. If your Pi is already flashed, skip to [S
 ## Step 2 — First boot & SSH
 
 ```bash
-ssh pi@tradingpi.local   # or use IP from your router
+ssh aso@tradingpi.local   # or use IP from your router
 ```
 
 Update and install OS-level deps:
@@ -73,22 +73,23 @@ Free tier gives 15 RPM on Gemini 2.5 Flash — matches our bot's rate limit.
 Option A — from this local Mac to the Pi:
 
 ```bash
-# On your Mac, from /Users/aso/:
-rsync -av --exclude='.venv' --exclude='logs' --exclude='.env' \
-    trading-bot/ pi@tradingpi.local:/home/pi/trading-bot/
+# On your Mac, from /Users/aso/Projects/:
+rsync -av --exclude='.venv' --exclude='__pycache__' --exclude='logs' --exclude='.env' \
+    --exclude='watchlist.txt' --exclude='watchlist_catalyst.txt' \
+    Trading-Bot/ aso@tradingpi.local:/home/aso/trading-bot/
 ```
 
 Option B — via git (once you push the project to your own repo):
 
 ```bash
 # On the Pi:
-git clone https://github.com/<you>/trading-bot.git /home/pi/trading-bot
+git clone https://github.com/<you>/trading-bot.git /home/aso/trading-bot
 ```
 
 ## Step 5 — Create venv and install dependencies
 
 ```bash
-cd /home/pi/trading-bot
+cd /home/aso/trading-bot
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -109,10 +110,11 @@ chmod 600 .env    # lock it down — contains paper keys and bot tokens
 ```bash
 source .venv/bin/activate
 python build_watchlist.py
-wc -l watchlist.txt   # should print roughly 1300 lines
+python build_catalyst_watchlist.py    # second list — biotech/FDA/high-short tickers
+wc -l watchlist.txt watchlist_catalyst.txt   # roughly 1,800 + 800 lines
 ```
 
-Re-run this monthly — index rebalances happen quarterly and annually.
+Re-run both monthly — index rebalances happen quarterly and annually.
 
 ## Step 8 — Smoke-test modules
 
@@ -130,10 +132,6 @@ python news.py AAPL
 # Scorer (uses Gemini quota — spends 1 request)
 python scorer.py
 
-# Telegram (sends a test alert to your chat; tap buttons)
-python telegram_handler.py
-# Ctrl+C when done testing.
-
 # Stream (only useful during market hours, 9:30–16:00 ET)
 python stream.py
 ```
@@ -149,7 +147,7 @@ You should see an alert in Telegram within ~30 seconds.
 ## Step 9 — Install the systemd service
 
 ```bash
-sudo cp /home/pi/trading-bot/trading-bot.service /etc/systemd/system/
+sudo cp /home/aso/trading-bot/trading-bot.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now trading-bot
 ```
@@ -179,19 +177,26 @@ sudo systemctl disable trading-bot
 journalctl -u trading-bot -f
 
 # Live app logs (more detail, rotated daily):
-tail -f /home/pi/trading-bot/logs/bot.log
+tail -f /home/aso/trading-bot/logs/bot.log
 
 # Check last 50 errors:
 journalctl -u trading-bot -p err -n 50
 
 # Update watchlist (monthly):
-cd /home/pi/trading-bot && source .venv/bin/activate && python build_watchlist.py && sudo systemctl restart trading-bot
+cd /home/aso/trading-bot && source .venv/bin/activate && python build_watchlist.py && sudo systemctl restart trading-bot
 ```
 
 ## Telegram commands once running
 
-- **Buttons on each alert**: Buy / Skip / Info / Sell
-- `/status` in the chat: reports how many trades are pending decision
+| Command | Description |
+|---------|-------------|
+| `/status` | Uptime, today's stats, open positions |
+| `/positions` | Detailed open-position list with entry price and hold time |
+| `/close TICKER` | Manually close a specific position at market price |
+| `/watchlist` | Number of tickers being monitored |
+| `/trades` | Last 5 closed trades from `state/trade_log.jsonl` |
+| `/regime` | Current HMM SPY regime label and size/hold multipliers |
+| `/perf` | Session P&L, win rate, by-reason and by-regime breakdown |
 
 ## Troubleshooting
 
@@ -200,7 +205,7 @@ cd /home/pi/trading-bot && source .venv/bin/activate && python build_watchlist.p
 | `RuntimeError: Missing required env var` | `.env` missing keys — recheck Step 6 |
 | Bot never alerts | Confirm market is open; run `--inject-trigger` to exercise the pipeline |
 | Telegram `Forbidden: bot was blocked` | You blocked the bot — unblock and `/start` again |
-| `ModuleNotFoundError` at service start | venv path wrong in service file, or `pip install` didn't hit the venv. `which python` should show `/home/pi/trading-bot/.venv/bin/python` when venv is active |
+| `ModuleNotFoundError` at service start | venv path wrong in service file, or `pip install` didn't hit the venv. `which python` should show `/home/aso/trading-bot/.venv/bin/python` when venv is active |
 | Repeated WS disconnects | Confirm Alpaca keys are **paper** keys if `ALPACA_PAPER=true`; live keys won't authenticate against paper endpoints |
 | `get_news` returns empty | Expected for many mid-caps; NewsAPI fallback handles these |
 

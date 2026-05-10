@@ -19,6 +19,7 @@ import logging
 import math
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 import aiohttp
 from alpaca.data.historical.stock import StockHistoricalDataClient
@@ -52,6 +53,35 @@ def _format_hold_time(secs: float) -> str:
     h = secs // 3600
     m = (secs % 3600) // 60
     return f"{h}h {m}m"
+
+
+def _derive_top_signals(verdict: CatalystVerdict, quant: dict | None) -> list[str]:
+    """Pick up to 3 short tags describing the strongest signals at entry.
+
+    Used by the post-trade reflection generator to give Gemini a compact view
+    of what the bot found compelling at entry, alongside the rationale text.
+    """
+    qs = quant or {}
+    short_int = qs.get("short_interest") or {}
+    ins_score = qs.get("insider_score") or {}
+    est_rev = qs.get("estimate_revisions") or {}
+    sector_mom = qs.get("sector_momentum") or {}
+
+    tags: list[str] = []
+    if verdict.catalyst_quality in ("strong", "moderate"):
+        tags.append(f"catalyst:{verdict.catalyst_type}-{verdict.catalyst_quality}")
+    if short_int.get("squeeze_score") in ("high", "medium"):
+        tags.append(f"squeeze:{short_int['squeeze_score']}")
+    if ins_score.get("insider_signal") == "bullish":
+        tags.append("insider:bullish")
+    rev_score = est_rev.get("revision_score") or 0
+    if isinstance(rev_score, (int, float)) and rev_score >= 1:
+        tags.append(f"revisions:+{int(rev_score)}")
+    if sector_mom.get("sector_momentum") == "bullish":
+        tags.append("sector:bullish")
+    if verdict.technical_signal == "bullish":
+        tags.append("tech:bullish")
+    return tags[:3]
 
 
 def _calc_take_profit(magnitude: int) -> float | None:
@@ -96,6 +126,10 @@ class ActivePosition:
     last_known_pnl_dollars: float = 0.0
     notified_milestones: set[str] = field(default_factory=set)
     had_factor_signal: bool = False       # True if any non-neutral quant signal at entry
+    regime: str = "unknown"               # HMM SPY regime label at entry time
+    # Captured at entry for the post-trade reflection prompt.
+    entry_rationale_text: str | None = None      # ≤200 chars from verdict.reasoning
+    entry_top_signals: list[str] = field(default_factory=list)  # up to 3 tags
 
 
 class Trader:
@@ -133,6 +167,63 @@ class Trader:
         self.session_blocked_tickers: set[str] = set()
         # Per-sector last entry time for duplicate catalyst guard (5-min window).
         self._sector_last_entry: dict[str, datetime] = {}
+        # References injected by run_position_monitor at startup so _monitor_tick
+        # can fire a timeout-driven Gemini re-eval instead of an unconditional
+        # close. None until run_position_monitor runs; _monitor_tick falls back
+        # to a hard close on timeout if any of these is still None.
+        self._monitor_scorer: Any = None
+        self._monitor_telegram: Any = None
+        self._monitor_http_session: Any = None
+        self._monitor_news_fingerprints: dict[str, frozenset] | None = None
+        # Optional ReflectionGenerator — set by bot.py at startup. Fired as a
+        # background task at the END of _handle_sell_fill / _close_fallback so
+        # the close path itself never awaits Gemini.
+        self._reflection_generator: Any = None
+        # Strong references for fire-and-forget background tasks (telegram
+        # sends, circuit-breaker checks, snapshot saves). The asyncio loop
+        # only holds weak refs, so without this set a task could be GC'd
+        # before it runs. Tasks remove themselves on completion.
+        self._background_tasks: set[asyncio.Task] = set()
+
+    def _spawn_background(self, coro) -> asyncio.Task:
+        """Schedule a fire-and-forget coroutine with a strong ref kept until done."""
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
+
+    def _dispatch_reflection(
+        self,
+        pos: ActivePosition,
+        *,
+        exit_price: float,
+        raw_return_pct: float,
+        exit_time: datetime,
+        reason: str,
+    ) -> None:
+        """Fire-and-forget reflection generation. Never awaits, never raises.
+
+        Skipped when no generator is wired (e.g. bot.py disabled the feature)
+        or when entry_price is unknown (ghost-position branch — no useful
+        reflection input). Pre-flight skip avoids creating a no-op task.
+        """
+        gen = self._reflection_generator
+        if gen is None or pos.entry_price is None:
+            return
+        self._spawn_background(
+            gen.on_trade_closed(
+                ticker=pos.ticker,
+                side="long",
+                entry_price=pos.entry_price,
+                exit_price=exit_price,
+                opened_at=pos.opened_at,
+                closed_at=exit_time,
+                raw_return_pct=raw_return_pct,
+                exit_reason=reason,
+                entry_rationale_text=pos.entry_rationale_text,
+                entry_top_signals=list(pos.entry_top_signals),
+            )
+        )
 
     # --- startup position re-sync ---
 
@@ -232,6 +323,15 @@ class Trader:
             max_hold_minutes = int(saved.get("max_hold_minutes") or config.MAX_HOLD_MINUTES)
             hold_strategy = saved.get("hold_strategy", "momentum")
 
+            saved_rationale = saved.get("entry_rationale_text")
+            entry_rationale_text = (
+                str(saved_rationale)[:200] if isinstance(saved_rationale, str) else None
+            )
+            saved_top = saved.get("entry_top_signals") or []
+            entry_top_signals = (
+                [str(t) for t in saved_top][:3] if isinstance(saved_top, list) else []
+            )
+
             pos = ActivePosition(
                 ticker=ticker,
                 qty=qty,
@@ -246,6 +346,10 @@ class Trader:
                 sl_floor=sl_floor,
                 max_hold_minutes=max_hold_minutes,
                 hold_strategy=hold_strategy,
+                regime=saved.get("regime", "unknown"),
+                had_factor_signal=bool(saved.get("had_factor_signal", False)),
+                entry_rationale_text=entry_rationale_text,
+                entry_top_signals=entry_top_signals,
             )
             self._positions[ticker] = pos
             source = "snapshot" if saved else "Alpaca fallback (no snapshot entry)"
@@ -278,6 +382,15 @@ class Trader:
                 "sl_floor": pos.sl_floor,
                 "max_hold_minutes": pos.max_hold_minutes,
                 "hold_strategy": pos.hold_strategy,
+                # Persisted so a restart preserves the regime tag (used in EOD
+                # recap by-regime breakdown) and the factor-signal flag
+                # (used in _handle_sell_fill to count factor_signals_correct).
+                "regime": pos.regime,
+                "had_factor_signal": pos.had_factor_signal,
+                # Persisted so the post-trade reflection prompt has access to
+                # the original entry rationale even after a bot restart.
+                "entry_rationale_text": pos.entry_rationale_text,
+                "entry_top_signals": pos.entry_top_signals,
             }
             for ticker, pos in self._positions.items()
         }
@@ -432,8 +545,8 @@ class Trader:
                 "all positions closed, halted for week"
             )
             log.warning(msg)
-            asyncio.create_task(self._telegram.send_message(msg))
-            asyncio.create_task(self._close_all_positions("weekly_halt"))
+            self._spawn_background(self._telegram.send_message(msg))
+            self._spawn_background(self._close_all_positions("weekly_halt"))
             return
 
         if (
@@ -447,7 +560,7 @@ class Trader:
                 "position sizes halved for rest of week"
             )
             log.warning(msg)
-            asyncio.create_task(self._telegram.send_message(msg))
+            self._spawn_background(self._telegram.send_message(msg))
 
         # --- daily tiers ---
         if not self._stats.halt_new_entries and daily_dd >= config.DAILY_HALT_PCT:
@@ -458,8 +571,8 @@ class Trader:
                 "all positions closed, trading halted"
             )
             log.warning(msg)
-            asyncio.create_task(self._telegram.send_message(msg))
-            asyncio.create_task(self._close_all_positions("daily_halt"))
+            self._spawn_background(self._telegram.send_message(msg))
+            self._spawn_background(self._close_all_positions("daily_halt"))
             return
 
         if (
@@ -491,6 +604,7 @@ class Trader:
         is_biotech: bool = False,
         sector: str = "unknown",
         quant_signals: dict | None = None,
+        regime: str = "unknown",
     ) -> bool:
         """Return True if an order was submitted; False for any capacity/quality rejection.
 
@@ -516,6 +630,7 @@ class Trader:
                 is_biotech=is_biotech,
                 sector=sector,
                 quant_signals=quant_signals,
+                regime=regime,
             )
         finally:
             self._buy_in_flight.discard(ticker)
@@ -535,6 +650,7 @@ class Trader:
         is_biotech: bool = False,
         sector: str = "unknown",
         quant_signals: dict | None = None,
+        regime: str = "unknown",
     ) -> bool:
         ticker = ctx.ticker
 
@@ -621,6 +737,19 @@ class Trader:
             config.GEMINI_SL_MIN,
             min(config.GEMINI_SL_MAX, _safe_float(verdict.stop_loss_pct, 0.05)),
         )
+
+        # ATR floor: SL must cover at least ATR_SL_MULTIPLIER × daily ATR
+        # so we don't get stopped out by normal intraday noise.
+        if ctx.technicals is not None and ctx.technicals.atr_14_pct is not None:
+            atr_floor = ctx.technicals.atr_14_pct / 100.0 * config.ATR_SL_MULTIPLIER
+            if atr_floor > stop_loss_pct:
+                log.info(
+                    "[ATR FLOOR] %s SL raised from %.1f%% to %.1f%% (ATR=%.1f%% × %.1f)",
+                    ticker, stop_loss_pct * 100, atr_floor * 100,
+                    ctx.technicals.atr_14_pct, config.ATR_SL_MULTIPLIER,
+                )
+                stop_loss_pct = min(atr_floor, config.GEMINI_SL_MAX)
+
         position_size_pct = max(
             config.GEMINI_SIZE_MIN,
             min(config.GEMINI_SIZE_MAX, _safe_float(verdict.position_size_pct, 0.10)),
@@ -744,6 +873,10 @@ class Trader:
             or (est_rev.get("revision_score") or 0) >= 1
         )
 
+        rationale_raw = (verdict.reasoning or "").strip()
+        entry_rationale_text = rationale_raw[:200] if rationale_raw else None
+        entry_top_signals = _derive_top_signals(verdict, quant_signals)
+
         active = ActivePosition(
             ticker=ticker,
             qty=qty,
@@ -759,6 +892,9 @@ class Trader:
             max_hold_minutes=max_hold_minutes,
             hold_strategy=hold_strategy,
             had_factor_signal=had_factor_signal,
+            regime=regime,
+            entry_rationale_text=entry_rationale_text,
+            entry_top_signals=entry_top_signals,
         )
         self._positions[ticker] = active
         if sector != "unknown":
@@ -796,7 +932,7 @@ class Trader:
         self, ticker: str, ref_price: float, position_size_pct: float | None = None
     ) -> tuple[int, str]:
         account = await asyncio.to_thread(self._trading.get_account)
-        equity = float(account.equity)
+        equity = float(account.non_marginable_buying_power)
         pct = position_size_pct if position_size_pct is not None else config.POSITION_SIZE_PCT
         allocation = equity * pct
         if allocation < 100.0:
@@ -814,7 +950,7 @@ class Trader:
         )
         order = await asyncio.to_thread(self._trading.submit_order, req)
         log.info(
-            "order submitted: %s qty=%d equity=$%.0f alloc=$%.0f (%.0f%%) id=%s",
+            "order submitted: %s qty=%d cash=$%.0f alloc=$%.0f (%.0f%%) id=%s",
             ticker, qty, equity, allocation, pct * 100, order.id,
         )
         return qty, str(order.id)
@@ -962,7 +1098,7 @@ class Trader:
             self._stats.factor_signals_correct += 1
 
         if self._stats.opening_equity > 0:
-            asyncio.create_task(self._check_circuit_breakers(pnl_dollars))
+            self._spawn_background(self._check_circuit_breakers(pnl_dollars))
 
         if pos.entry_price is not None:
             try:
@@ -977,11 +1113,20 @@ class Trader:
                     hold_secs=hold_secs,
                     reason=reason,
                     opened_at=pos.opened_at,
+                    regime=pos.regime,
                 ))
             except Exception:
                 log.debug("TradeRecord append failed", exc_info=True)
             await self._write_trade_log(
                 pos, round(fill_price, 4), pnl_pct, pnl_dollars, hold_secs, reason, exit_time
+            )
+            # Background reflection — close path never awaits this.
+            self._dispatch_reflection(
+                pos,
+                exit_price=float(fill_price),
+                raw_return_pct=pnl_pct,
+                exit_time=exit_time,
+                reason=reason,
             )
 
         self._positions.pop(ticker, None)
@@ -1047,7 +1192,7 @@ class Trader:
         self._stats.weekly_pnl += pnl_dollars
 
         if self._stats.opening_equity > 0:
-            asyncio.create_task(self._check_circuit_breakers(pnl_dollars))
+            self._spawn_background(self._check_circuit_breakers(pnl_dollars))
 
         if pos.entry_price is not None and exit_price > 0:
             try:
@@ -1062,11 +1207,20 @@ class Trader:
                     hold_secs=hold_secs,
                     reason=reason,
                     opened_at=pos.opened_at,
+                    regime=pos.regime,
                 ))
             except Exception:
                 log.debug("TradeRecord append failed (fallback path)", exc_info=True)
             await self._write_trade_log(
                 pos, round(exit_price, 4), pnl_pct, pnl_dollars, hold_secs, reason, exit_time
+            )
+            # Background reflection — close path never awaits this.
+            self._dispatch_reflection(
+                pos,
+                exit_price=float(exit_price),
+                raw_return_pct=pnl_pct,
+                exit_time=exit_time,
+                reason=reason,
             )
 
         self._positions.pop(ticker, None)
@@ -1168,7 +1322,10 @@ class Trader:
                 log.info("EOD close: no open positions")
 
             self.session_blocked_tickers.clear()
-            log.info("EOD: session_blocked_tickers cleared for next session")
+            self._sector_last_entry.clear()
+            log.info(
+                "EOD: session_blocked_tickers and _sector_last_entry cleared for next session"
+            )
 
     # --- monitoring loop ---
 
@@ -1222,27 +1379,93 @@ class Trader:
                             ticker,
                         )
                     else:
-                        # Position disappeared without a bot-submitted close
-                        # (manual Alpaca dashboard close, forced liquidation, etc.)
-                        # No fill event expected.  Best effort: use pnl=0 as estimate
-                        # since we never captured a P&L snapshot, and log a warning.
-                        log.warning(
-                            "monitor_tick: %s gone from Alpaca without close_submitted "
-                            "(external close? forced liquidation?); recording with pnl=0",
-                            ticker,
-                        )
-                        active.close_reason = "external_close"
+                        # Ghost position: the BUY was submitted (trades_taken
+                        # incremented, position tracked) but the TradingStream
+                        # fill event never arrived AND the position is now gone
+                        # from Alpaca. Without recording it here, trades_taken
+                        # diverges from len(stats.trade_records) and the trade
+                        # leaves no audit trail.
+                        # Synthesize a zero-P&L close record so accounting stays
+                        # in parity, and notify operator to investigate.
+                        reason = "disappeared_no_fill_confirmation"
+                        active.close_reason = reason
                         active.last_known_pnl_pct = 0.0
                         active.last_known_pnl_dollars = 0.0
+
+                        exit_time = datetime.now(timezone.utc)
+                        hold_secs = (exit_time - opened_utc).total_seconds()
+
+                        if active.entry_price is not None:
+                            log.warning(
+                                "monitor_tick: %s gone from Alpaca without "
+                                "close_submitted (entry_price known) — "
+                                "recording zero-P&L trade for accounting parity",
+                                ticker,
+                            )
+                            try:
+                                from daily_summary import TradeRecord
+                                self._stats.trade_records.append(TradeRecord(
+                                    ticker=ticker,
+                                    qty=active.qty,
+                                    entry_price=active.entry_price,
+                                    exit_price=round(active.entry_price, 4),
+                                    pnl_dollars=0.0,
+                                    pnl_pct=0.0,
+                                    hold_secs=hold_secs,
+                                    reason=reason,
+                                    opened_at=active.opened_at,
+                                    regime=active.regime,
+                                ))
+                            except Exception:
+                                log.debug(
+                                    "TradeRecord append failed (ghost path)",
+                                    exc_info=True,
+                                )
+                            try:
+                                await self._write_trade_log(
+                                    active,
+                                    round(active.entry_price, 4),
+                                    0.0, 0.0, hold_secs, reason, exit_time,
+                                )
+                            except Exception:
+                                log.debug(
+                                    "trade log write failed (ghost path)",
+                                    exc_info=True,
+                                )
+                        else:
+                            # entry_price never confirmed — order may have
+                            # been rejected after submission. Skip the trade
+                            # log entry rather than write nonsense numbers.
+                            log.warning(
+                                "monitor_tick: %s gone from Alpaca without "
+                                "close_submitted AND entry_price unset — "
+                                "buy fill never confirmed; cannot synthesize "
+                                "trade record",
+                                ticker,
+                            )
+
+                        try:
+                            await self._telegram.send_message(
+                                f"⚠️ <b>{ticker}</b> disappeared from Alpaca "
+                                f"without fill confirmation — removed from "
+                                f"tracking, recorded P&L $0. Check Alpaca "
+                                f"dashboard."
+                            )
+                        except Exception:
+                            log.debug(
+                                "ghost-position telegram failed",
+                                exc_info=True,
+                            )
+
                         self._positions.pop(ticker, None)
                         self._closing_in_progress.discard(ticker)
                         if self._cooldown_store is not None:
                             await self._cooldown_store.set_cooldown(ticker)
                             log.info(
-                                "exit cooldown set for %s (%dmin) after external_close",
-                                ticker, config.EXIT_COOLDOWN_MINUTES,
+                                "exit cooldown set for %s (%dmin) after %s",
+                                ticker, config.EXIT_COOLDOWN_MINUTES, reason,
                             )
-                        asyncio.create_task(self._save_positions_snapshot())
+                        self._spawn_background(self._save_positions_snapshot())
                 continue
 
             active = self._positions[ticker]
@@ -1259,13 +1482,48 @@ class Trader:
 
             plpc = float(live.unrealized_plpc)
 
-            # Gemini-set hold time: only timeout profitable positions so a losing
-            # trade is never forced out by the clock (SL or EOD handles that).
-            if hold_mins >= active.max_hold_minutes and plpc >= 0:
-                await self._close_position(
-                    ticker,
-                    reason=f"timeout — Gemini hold limit {active.max_hold_minutes}min reached",
-                )
+            # Gemini-set hold time: only timeout profitable positions so a
+            # losing trade is never forced out by the clock (SL or EOD handles
+            # that). Use 0.001 (~10 bps) as the threshold instead of >=0 to
+            # avoid float-precision races where Alpaca returns 0.0 at the tick
+            # moment and the position is slightly negative by the time the
+            # close fills (MRP closed at -0.07% on 2026-05-07 via this race).
+            if hold_mins >= active.max_hold_minutes and plpc >= 0.001:
+                if (self._monitor_scorer is not None
+                        and self._monitor_telegram is not None
+                        and self._monitor_http_session is not None):
+                    log.info(
+                        "[TIMEOUT] %s hold limit %dmin reached (P&L %.2f%%) — "
+                        "triggering immediate Gemini re-look",
+                        ticker, active.max_hold_minutes, plpc * 100,
+                    )
+                    # Push the deadline 30 minutes out so the next monitor
+                    # tick doesn't re-fire while the task is in flight.
+                    active.max_hold_minutes = int(hold_mins) + 30
+                    # Lazy import to avoid circular dependency at module load
+                    # (position_monitor imports Trader at module level).
+                    from position_monitor import _timeout_reeval
+                    self._spawn_background(_timeout_reeval(
+                        ticker,
+                        self,
+                        self._monitor_scorer,
+                        self._monitor_telegram,
+                        self._monitor_http_session,
+                        self._monitor_news_fingerprints,
+                    ))
+                else:
+                    # Position monitor never started or refs got cleared —
+                    # fall back to the original hard-close behaviour rather
+                    # than letting the position drift forever.
+                    log.warning(
+                        "[TIMEOUT] %s hold limit reached but monitor refs "
+                        "unavailable — falling back to hard close",
+                        ticker,
+                    )
+                    await self._close_position(
+                        ticker,
+                        reason=f"timeout — Gemini hold limit {active.max_hold_minutes}min reached",
+                    )
                 continue
 
             if plpc >= active.take_profit_pct:
@@ -1318,15 +1576,18 @@ class Trader:
                 )
 
             # Within 1% of take profit.
-            if (
-                plpc >= active.take_profit_pct - 0.01
-                and "near_tp" not in active.notified_milestones
-            ):
-                active.notified_milestones.add("near_tp")
-                await self._telegram.send_message(
-                    f"🎯 <b>{ticker}</b> approaching take profit: {plpc:+.2%} "
-                    f"(TP at +{active.take_profit_pct:.0%})"
-                )
+            near_tp_threshold = active.take_profit_pct - config.NEAR_TP_EXIT_PCT
+            if plpc >= near_tp_threshold:
+                if "near_tp" not in active.notified_milestones:
+                    active.notified_milestones.add("near_tp")
+                    await self._telegram.send_message(
+                        f"🎯 <b>{ticker}</b> approaching take profit: {plpc:+.2%} "
+                        f"(TP at +{active.take_profit_pct:.0%}) — will close here"
+                    )
+                # Close if we've held long enough — don't bail in the first 20 minutes
+                if hold_mins >= config.NEAR_TP_MIN_HOLD_MINUTES:
+                    await self._close_position(ticker, reason=f"near-TP {plpc:+.1%}")
+                    continue
 
     # --- trading stream (fill confirmations) ---
 
@@ -1353,10 +1614,15 @@ class Trader:
                         pos = self._positions[symbol]
                         if order.filled_avg_price:
                             pos.entry_price = float(order.filled_avg_price)
-                        await self._telegram.send_message(
-                            f"✅ Filled {order.filled_qty} × <b>{symbol}</b> @ "
-                            f"${float(order.filled_avg_price or 0):.2f}"
-                        )
+                        # Send Telegram notification only on the FINAL fill —
+                        # a single buy can deliver many partial_fill events
+                        # (CORZ produced 7 on 2026-05-07) which would spam chat.
+                        if event == "fill":
+                            await self._telegram.send_message(
+                                f"✅ Filled {order.filled_qty} × <b>{symbol}</b> @ "
+                                f"${float(order.filled_avg_price or 0):.2f}"
+                            )
+                        # partial_fill: silently update entry_price only.
 
                     # --- SELL fill: single source of truth for P&L accounting ---
                     elif side == OrderSide.SELL and event == "fill":
@@ -1406,6 +1672,7 @@ class Trader:
                 paper=config.ALPACA_PAPER,
             )
             stream.subscribe_trade_updates(on_trade_update)
+            connected_at = asyncio.get_running_loop().time()
             stream_task = asyncio.create_task(asyncio.to_thread(stream.run))
             stop_task = asyncio.create_task(stop_event.wait())
             done, _ = await asyncio.wait(
@@ -1418,7 +1685,15 @@ class Trader:
                     log.exception("error stopping TradingStream")
                 stream_task.cancel()
                 return
-            log.warning("TradingStream exited; reconnecting in %.1fs", backoff)
+            # Reset backoff if the stream ran cleanly for ≥60s — a single late
+            # disconnect should not push the next reconnect to a 60s wait.
+            ran_secs = asyncio.get_running_loop().time() - connected_at
+            if ran_secs >= 60.0:
+                backoff = 1.0
+            log.warning(
+                "TradingStream exited after %.0fs; reconnecting in %.1fs",
+                ran_secs, backoff,
+            )
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=backoff)
                 return

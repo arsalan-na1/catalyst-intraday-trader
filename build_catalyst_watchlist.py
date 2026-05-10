@@ -44,6 +44,12 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
+# Tickers that must always be in the catalyst watchlist regardless of what
+# FinViz or MarketBeat return — names with active catalyst flow that the
+# screeners frequently miss (small float, recent IPOs, sector-specific).
+MANUAL_ADDITIONS = {"RKLB", "ASTS", "LUNR", "PL", "ACHR"}
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # 1.  FinViz  (primary)
 # ──────────────────────────────────────────────────────────────────────────
@@ -234,6 +240,17 @@ def main():
         if t and t not in seen:
             seen.add(t)
             combined.append(t)
+
+    # Merge manual additions — included unconditionally even when both sources
+    # come back empty, so a screener outage never drops these tickers.
+    manual_added = 0
+    for t in MANUAL_ADDITIONS:
+        t = t.upper().strip()
+        if t and t not in seen:
+            seen.add(t)
+            combined.append(t)
+            manual_added += 1
+    log.info("Manual additions: %d tickers", manual_added)
 
     if not combined:
         log.error("No tickers collected — watchlist_catalyst.txt NOT written.")

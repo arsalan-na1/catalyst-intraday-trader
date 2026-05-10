@@ -27,6 +27,11 @@ _congress_cache: dict[str, tuple[float, dict]] = {}
 _earnings_surp_cache: dict[str, tuple[float, dict]] = {}
 _insider_score_cache: dict[str, tuple[float, dict | None]] = {}
 
+# Once Finnhub returns 403 for the congressional-trades endpoint we know it is
+# not available on the current plan. Latch the flag for the rest of the session
+# so we stop burning rate-limit slots and stop spamming warnings.
+_congressional_403: bool = False
+
 
 def _client():
     import finnhub  # lazy import — only used when key is set
@@ -158,7 +163,8 @@ def _fetch_congressional_trades_sync(ticker: str) -> dict:
 
 async def get_congressional_trades(ticker: str) -> dict:
     """Congressional buy/sell trades in the last 90 days."""
-    if not config.FINNHUB_API_KEY:
+    global _congressional_403
+    if not config.FINNHUB_API_KEY or _congressional_403:
         return {}
     now = time.monotonic()
     cached = _congress_cache.get(ticker)
@@ -172,7 +178,16 @@ async def get_congressional_trades(ticker: str) -> dict:
     except asyncio.TimeoutError:
         log.warning("finnhub congressional trades timed out for %s", ticker)
         return {}
-    except Exception:
+    except Exception as e:
+        # FinnhubAPIException carries .status_code on HTTP errors. Use getattr
+        # so the check still works if the library wraps the response differently.
+        if getattr(e, "status_code", None) == 403:
+            _congressional_403 = True
+            log.warning(
+                "[FINNHUB] Congressional trades endpoint returned 403 — "
+                "not available on this plan. Disabling for session."
+            )
+            return {}
         log.warning("finnhub congressional trades failed for %s", ticker, exc_info=True)
         return {}
     _congress_cache[ticker] = (now, data)
@@ -231,7 +246,6 @@ async def get_earnings_surprise(ticker: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def _fetch_insider_score_sync(ticker: str) -> dict | None:
-    from datetime import date, timedelta
     from_date = (date.today() - timedelta(days=90)).strftime("%Y-%m-%d")
     to_date = date.today().strftime("%Y-%m-%d")
     # Note: the finnhub Python SDK uses _from (not from_date) because 'from' is

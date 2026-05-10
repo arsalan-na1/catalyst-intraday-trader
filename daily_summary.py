@@ -31,6 +31,9 @@ class TradeRecord:
     hold_secs: float
     reason: str
     opened_at: datetime
+    # HMM SPY regime label captured at entry time. Defaults to "unknown" so
+    # earlier records that never set the field still deserialise cleanly.
+    regime: str = "unknown"
 
 
 @dataclass
@@ -192,6 +195,26 @@ def _build_rich_summary(
                 f"- Signals that were correct (TP hit): {stats.factor_signals_correct}"
             )
 
+    # Regime breakdown — group today's trades by HMM regime label at entry.
+    if stats.trade_records:
+        by_regime: dict[str, list[TradeRecord]] = {}
+        for rec in stats.trade_records:
+            label = getattr(rec, "regime", "unknown") or "unknown"
+            by_regime.setdefault(label, []).append(rec)
+        if by_regime:
+            lines.append("")
+            lines.append("🌐 <b>By Regime:</b>")
+            for label in sorted(by_regime):
+                bucket = by_regime[label]
+                wins_b = sum(1 for r in bucket if r.pnl_dollars > 0)
+                avg_pnl_pct = sum(r.pnl_pct for r in bucket) / len(bucket)
+                lines.append(
+                    f"- {label}: {len(bucket)} trades, "
+                    f"{wins_b}/{len(bucket)} win "
+                    f"({wins_b / len(bucket):.0%}), "
+                    f"avg P&amp;L {avg_pnl_pct:+.1%}"
+                )
+
     return "\n".join(lines)
 
 
@@ -289,6 +312,22 @@ async def run_daily_summary(
         monthly_cost = getattr(scorer, "monthly_cost_estimate", None)
         monthly_cap = getattr(config, "MONTHLY_GEMINI_BUDGET_USD", None)
 
+        # Log regime breakdown for ops visibility before sending.
+        if stats.trade_records:
+            by_regime: dict[str, list[TradeRecord]] = {}
+            for rec in stats.trade_records:
+                by_regime.setdefault(
+                    getattr(rec, "regime", "unknown") or "unknown", []
+                ).append(rec)
+            for label, bucket in sorted(by_regime.items()):
+                wins_b = sum(1 for r in bucket if r.pnl_dollars > 0)
+                avg_pnl_pct = sum(r.pnl_pct for r in bucket) / len(bucket)
+                log.info(
+                    "[REGIME RECAP] %s: %d trades, %d/%d win (%.0f%%), avg P&L %.1f%%",
+                    label, len(bucket), wins_b, len(bucket),
+                    wins_b / len(bucket) * 100, avg_pnl_pct * 100,
+                )
+
         try:
             msg = _build_rich_summary(
                 stats, gemini_calls, balance, now_utc,
@@ -324,7 +363,10 @@ async def run_daily_summary(
         stats.reset()
         if trader is not None:
             trader.session_blocked_tickers.clear()
-            log.info("daily reset: session_blocked_tickers cleared")
+            trader._sector_last_entry.clear()
+            log.info(
+                "daily reset: session_blocked_tickers and _sector_last_entry cleared"
+            )
         if balance:
             stats.opening_equity = balance
             log.info("opening equity refreshed to $%.2f for new session", balance)
