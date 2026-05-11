@@ -748,8 +748,8 @@ class Scorer:
     ) -> str:
         gap_pct_val = abs(ctx.price_move_pct) * 100
         rsi_val = (
-            f"{tech.rsi:.0f}"
-            if tech is not None and tech.rsi is not None
+            f"{tech.rsi_14:.0f}"
+            if tech is not None and tech.rsi_14 is not None
             else "N/A"
         )
         news_summary = self._news_block(news)
@@ -836,11 +836,21 @@ class Scorer:
         if not self._check_hourly_limit():
             self.calls_skipped += 1
             return None
+        # Build prompt BEFORE charging budget/slots: if our own code raises
+        # during prompt construction, we haven't actually called Gemini and
+        # must not consume any of the 60/hr cap, monthly budget, or RPM slot.
+        try:
+            prompt = self._build_research_prompt(ctx, news)
+        except Exception:
+            log.exception(
+                "research prompt build failed for %s; budget not charged",
+                ctx.ticker,
+            )
+            return None
         # Monthly budget gate — must pass before incurring grounded-call cost.
         if not self._record_call_cost(is_grounded=True):
             self.calls_skipped += 1
             return None
-        prompt = self._build_research_prompt(ctx, news)
         await self._limiter.acquire()
         self._consume_hourly_slot()
         self.calls_today += 1
@@ -879,16 +889,26 @@ class Scorer:
         if not self._check_hourly_limit():
             self.calls_skipped += 1
             return None
+        # Build prompt BEFORE charging budget/slots: if our own code raises
+        # during prompt construction, we haven't actually called Gemini and
+        # must not consume any of the 60/hr cap, monthly budget, or RPM slot.
+        try:
+            prompt = self._build_verdict_prompt(
+                ctx, news, research, tech, fundamentals,
+                insider, earnings_cal, congress, earnings_surp, reddit,
+                quant_signals=quant_signals,
+                sector_name=sector_name,
+            )
+        except Exception:
+            log.exception(
+                "verdict prompt build failed for %s; budget not charged",
+                ctx.ticker,
+            )
+            return None
         # Monthly budget gate — verdict calls are always ungrounded.
         if not self._record_call_cost(is_grounded=False):
             self.calls_skipped += 1
             return None
-        prompt = self._build_verdict_prompt(
-            ctx, news, research, tech, fundamentals,
-            insider, earnings_cal, congress, earnings_surp, reddit,
-            quant_signals=quant_signals,
-            sector_name=sector_name,
-        )
         await self._limiter.acquire()
         self._consume_hourly_slot()
         self.calls_today += 1

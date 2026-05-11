@@ -225,6 +225,12 @@ MICROCAP_PRICE_MIN = _float("MICROCAP_PRICE_MIN", 1.00)
 MICROCAP_PRICE_MAX = _float("MICROCAP_PRICE_MAX", 20.00)
 MICROCAP_VOL_RATIO_MIN = _float("MICROCAP_VOL_RATIO_MIN", 4.0)
 MICROCAP_MARKET_CAP_MAX = _float("MICROCAP_MARKET_CAP_MAX", 500_000_000.0)
+# Fail-closed: when shares_outstanding is unavailable, skip the ticker rather
+# than scoring it without the market-cap filter. The filter exists to block
+# illiquid sub-$300M names; bypassing on missing data defeats the purpose on
+# exactly the tickers it targets. Set to False only to restore the old
+# fail-open behavior (not recommended for live trading).
+MICROCAP_REQUIRE_MCAP = _bool("MICROCAP_REQUIRE_MCAP", True)
 MICROCAP_DEDUP_HOURS = _int("MICROCAP_DEDUP_HOURS", 6)
 MICROCAP_MIN_DOLLAR_VOLUME = _float("MICROCAP_MIN_DOLLAR_VOLUME", 500_000.0)
 

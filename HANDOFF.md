@@ -1,6 +1,6 @@
 # HANDOFF — Trading Bot
 
-Last updated: 2026-05-10
+Last updated: 2026-05-11
 
 This file is the running operational record for the bot. CLAUDE.md is for
 agents working on the code; HANDOFF.md is for the human (or next agent)
@@ -9,6 +9,117 @@ who picks up where the last session left off.
 ---
 
 ## What Was Built
+
+### 2026-05-11 — critical production fixes (zero-trades incident resolved)
+
+**Incident.** Bot made zero trades on 2026-05-11 despite multiple obvious
+catalysts (ODYS +76%, WOK +164%, JZXN +80%). Root cause was a stale
+attribute reference in `_build_verdict_prompt` that crashed every Stage-2
+grounded verdict; the crash burned monthly budget on dead calls and
+exposed a fail-open mcap filter on the screener side. Three coupled fixes
+landed in one commit.
+
+**Fix 1 — `Technicals.rsi` → `Technicals.rsi_14`.** Canonical attribute on
+the dataclass at `technicals.py:37` is `rsi_14`. Two call sites referenced
+`.rsi` and crashed with `AttributeError: 'Technicals' object has no
+attribute 'rsi'`:
+
+- `scorer.py:750-754` — verdict prompt build (the headline crash)
+- `bot.py:217-223` — `MAX_ENTRY_RSI` ceiling gate (second crash site
+  found via grep)
+
+Both now use `rsi_14`. Project-wide audit grep
+`grep -rn '\.rsi\b' --include='*.py' | grep -v 'rsi_14\|rsi_period\|_rsi\|_compute_rsi'`
+returns zero hits.
+
+**Fix 2 — Gemini budget: don't charge crashed prompts.** In
+`_research_with_grounding` (`scorer.py:833`) and `_verdict_from_research`
+(`scorer.py:879`), `_record_call_cost(...)` was called BEFORE
+`_build_*_prompt(...)`. When the prompt build raised AttributeError, the
+monthly budget was already debited but no Gemini API call was made.
+Restructured both functions so prompt construction happens inside a
+try/except that returns None without charging anything; only on a
+successful build do we charge budget, consume RPM and hourly slots, and
+increment `calls_today`. The third call site `score_open_position`
+(around `scorer.py:1220`) was already structured correctly (prompt built
+outside the gate block) — not touched.
+
+The 60-calls/hr cap was NOT raised; the fix is to stop wasting it on our
+own bugs.
+
+**Fix 3 — Microcap mcap filter: fail-closed.** In
+`microcap_screener._evaluate` (`microcap_screener.py:262`), when
+`_get_market_cap` returned None (alpaca-py's `Asset.shares_outstanding`
+is not on every tier), the old branch logged "tracking without mcap
+filter" and proceeded to score the ticker AND subscribe it to the WS
+stream. The filter exists to block illiquid sub-$300M names; bypassing
+on the exact tickers where data is missing defeats the purpose.
+
+New behavior: when `config.MICROCAP_REQUIRE_MCAP` is True (default), log
+"mcap unavailable; skipping per fail-closed policy" and return — no
+scoring, no WS subscription. The flag is a new env var, declared in
+`config.py` next to the other `MICROCAP_*` settings. Set
+`MICROCAP_REQUIRE_MCAP=false` to restore old behavior (not recommended
+for live trading). The old fall-through path is preserved under `else:`
+so the escape hatch is a one-line config change, not code surgery.
+
+**Code-reviewer pass.** `feature-dev:code-reviewer` agent reviewed all
+three fixes together. No critical or important findings. Two non-blocking
+suggestions: (1) add a unit test next session for the
+prompt-build-before-charge ordering — the logic is simple enough that a
+mock raising in `_build_verdict_prompt` would catch a regression in <10
+lines, (2) document the new flag in CLAUDE.md (done as part of this
+session). Confirmed:
+
+- `return` (vs `continue`) is correct in `_evaluate` — caller `_poll_once`
+  awaits the coroutine inside a for-loop with its own try/except wrapper,
+  so `return` correctly exits the per-symbol path
+- The `else:` branch preserving fail-open behavior under the flag
+  correctly falls through to scoring without re-entering the elif
+  market-cap ceiling check
+- No `getattr(tech, "rsi", ...)` dynamic-access patterns anywhere — the
+  grep is sufficient
+- Pre-existing concern: `score_open_position` (line 1240) builds prompt
+  outside the `async with self._position_sem:` block, so an exception
+  there propagates up to the caller. Not introduced by this diff; flagged
+  for future cleanup
+
+**Documentation.** Added "Risk-filter posture: fail closed" rule to
+`CLAUDE.md` under the Watchlist tiers section, plus `MICROCAP_REQUIRE_MCAP`
+to the config thresholds table. The rule generalizes beyond mcap: any
+future risk filter must block when its inputs are missing.
+
+**Verification.**
+
+- `python3 -m py_compile bot.py scorer.py microcap_screener.py config.py` — clean.
+- `python3 -m pytest tests/ -v` — 46 passed, 0 failed (was already 46 passing
+  pre-change; added no new tests this session per scope).
+- Pi deploy: synced via rsync, restarted via systemctl, bot came up
+  healthy. Service active since 17:21:50 EDT, all subsystems started
+  (watchlist 2,314 tickers, cooldown store, Telegram polling, earnings
+  calendar 52 tickers via Yahoo fallback, microcap screener poll=180s,
+  Alpaca data + trading WS connected). No `AttributeError`, no
+  `Traceback` other than the known-non-issue NASDAQ earnings startup
+  timeout.
+- Live verdict-path verification deferred to next market open
+  (2026-05-12 09:30 ET) — the .rsi code path only executes when a
+  trigger fires and Gemini scores it, which can't happen with market
+  closed. Watch for: (1) no `AttributeError: 'Technicals' object has no
+  attribute 'rsi'`, (2) Stage-2 verdicts producing results instead of
+  "no verdict for X; skipping", (3) on tickers with no
+  `shares_outstanding`, "mcap unavailable; skipping per fail-closed
+  policy" instead of "tracking without mcap filter".
+
+**Follow-ups for next session.**
+
+- Add a regression test in `tests/` that mocks `_build_verdict_prompt` to
+  raise and asserts `_record_call_cost` was NOT invoked
+  (`monthly_cost_estimate` unchanged) and hourly slot not consumed.
+- Consider applying the same try/except prompt-build pattern to
+  `score_open_position` for defense-in-depth (currently relies on the
+  caller's try/except).
+- Watch the first market session post-fix for any new failure modes the
+  silently-failing verdicts had been masking.
 
 ### 2026-05-10 second session — post-trade reflection loop
 

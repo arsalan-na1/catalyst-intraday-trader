@@ -180,6 +180,8 @@ Self-skips on weekends and when fewer than `MIN_TRADES_FOR_ANALYSIS = 5` trades 
 - `watchlist_catalyst.txt` — FDA/biotech/squeeze names (~787 tickers), threshold 5% (`PRICE_TRIGGER_CATALYST_PCT`)
 - `microcap_screener.py` — independent polling of Alpaca most-actives endpoint every 3 min
 
+**Risk-filter posture: fail closed.** When inputs to a risk filter are missing, the filter must block — not pass — the candidate. The microcap market-cap filter is the reference case: `MICROCAP_REQUIRE_MCAP=true` (default) skips any ticker whose `shares_outstanding` is unavailable, because the filter exists to block illiquid sub-$300M names and bypassing on missing data defeats the purpose on exactly the tickers it targets. Same principle applies to any future risk filter — never let absent data downgrade a safety check.
+
 ### State files (`state/` directory)
 
 | File | Written by | Read by |
@@ -259,6 +261,8 @@ Self-skips on weekends and when fewer than `MIN_TRADES_FOR_ANALYSIS = 5` trades 
 | **Kronos secondary confirmation** | | |
 | USE_KRONOS | true | Toggle Kronos-mini gate after Gemini buy approval; false skips the lazy import |
 | KRONOS_MIN_PROB | 0.45 | Minimum continuation probability to allow the buy through |
+| **Microcap screener** | | |
+| MICROCAP_REQUIRE_MCAP | true | Fail-closed: skip ticker when `shares_outstanding` is unavailable. Set false only to restore the old fail-open behavior. |
 
 `config._required()` raises `RuntimeError` at import time for missing secrets — the bot will not start without valid Alpaca, Gemini, and Telegram credentials. `ALPACA_PAPER=true` must be set for paper trading; flipping to `false` routes real orders.
 

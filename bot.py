@@ -215,11 +215,11 @@ async def _process_trigger(
         # severely overbought names anyway (INTC RSI 86 on 2026-05-07).
         # Fail open when technicals are unavailable.
         if (ctx.technicals is not None
-                and ctx.technicals.rsi is not None
-                and ctx.technicals.rsi > config.MAX_ENTRY_RSI):
+                and ctx.technicals.rsi_14 is not None
+                and ctx.technicals.rsi_14 > config.MAX_ENTRY_RSI):
             log.info(
                 "[RSI GATE] %s skipped — RSI %.0f > MAX_ENTRY_RSI %d",
-                event.ticker, ctx.technicals.rsi, config.MAX_ENTRY_RSI,
+                event.ticker, ctx.technicals.rsi_14, config.MAX_ENTRY_RSI,
             )
             return
 

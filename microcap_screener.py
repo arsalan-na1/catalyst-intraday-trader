@@ -261,6 +261,16 @@ class MicrocapScreener:
 
         market_cap = await self._get_market_cap(symbol, price)
         if market_cap is None:
+            # Fail-closed: the mcap filter exists to block illiquid sub-$300M
+            # names where slippage destroys edge. Bypassing it on missing data
+            # would defeat the purpose on exactly the tickers it targets, so
+            # we skip the ticker entirely (controlled by MICROCAP_REQUIRE_MCAP).
+            if config.MICROCAP_REQUIRE_MCAP:
+                log.info(
+                    "%s %s mcap unavailable; skipping per fail-closed policy",
+                    _LOG_PREFIX, symbol,
+                )
+                return
             log.info(
                 "%s %s shares_outstanding unavailable; tracking without mcap filter",
                 _LOG_PREFIX, symbol,
