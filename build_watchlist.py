@@ -165,6 +165,7 @@ def _fetch_wikipedia_bs4(html: str, name: str) -> set[str]:
 
 
 def fetch_sp400() -> set[str]:
+    """Return the S&P 400 constituents retrieved from Wikipedia."""
     return _fetch_wikipedia_index(SP400_URL, "S&P 400")
 
 
