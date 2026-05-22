@@ -200,8 +200,8 @@ Self-skips on weekends and when fewer than `MIN_TRADES_FOR_ANALYSIS = 5` trades 
 
 **Gemini-driven trade parameters** — Gemini sets TP, SL, position size, hold time, and hold strategy per trade via `CatalystVerdict`. Hard floors/ceilings enforced in `trader.py`:
 - `take_profit_pct`: 0.05–0.50 (Gemini sets based on catalyst strength)
-- `stop_loss_pct`: 0.02–0.10 (Gemini sets based on volatility/thesis risk)
-- `position_size_pct`: 0.02–0.12 (Gemini scales with confidence; biotech gets 0.02–0.05)
+- `stop_loss_pct`: 0.02–0.18 (Gemini sets based on volatility/thesis risk; ceiling raised from 0.10 → 0.18 so the ATR floor isn't immediately reclamped on high-ATR names)
+- `position_size_pct`: 0.02–0.12 (Gemini scales with confidence). **Biotech is hard-capped at `BIOTECH_POSITION_SIZE_PCT` (default 5%)** by `trader._apply_biotech_cap`. The cap binds when EITHER `sector ∈ BIOTECH_SECTORS` OR `is_biotech` (the `is_biotech_catalyst(news)` flag threaded from `bot._process_trigger`). The OR closes the case where `news.determine_sector()` short-circuits to the static `_SECTOR_MAP` before checking the FDA-news fallback — a tech-mapped ticker firing on an FDA event would otherwise escape the cap. Sector-concentration logic is **deliberately not** tied to `is_biotech`: that asks "what bucket is this company?" while the cap asks "is this catalyst gap-risk?" Sector "unknown" with no FDA news flag is **not** capped (fail-safe).
 - `max_hold_minutes`: 30–390 (Gemini sets per `hold_strategy`: momentum/catalyst/swing)
 - `should_trade`: Gemini's explicit trade/no-trade decision replaces confidence threshold
 
@@ -238,7 +238,10 @@ Self-skips on weekends and when fewer than `MIN_TRADES_FOR_ANALYSIS = 5` trades 
 | GAP_OPEN_THRESHOLD | 15% | Min gap vs prev close to fire gap-open trigger |
 | GAP_OPEN_WINDOW_MINUTES | 2 | Window after 9:30 ET to detect gaps |
 | OPENING_BELL_MINUTES | 3 | Suppress intraday triggers at open (gap-open bypasses this) |
-| MAX_ENTRY_RSI | 82 | Bot-side hard ceiling on RSI for entries (rejects regardless of Gemini verdict) |
+| RSI_MAX_ENTRY | 72 | Bot-side hard ceiling on RSI for entries (rejects regardless of Gemini verdict). Lowered from 82 — renamed env var, old `MAX_ENTRY_RSI` no longer read. |
+| REJECT_DOWNTREND | true | Skip entries when daily trend == "downtrend" (price < SMA50 AND SMA50 < SMA200) |
+| FALLING_KNIFE_DRAWDOWN_PCT | 0.40 | Skip when >40% below 52-week high AND trend is not "uptrend" |
+| TREND_GATE_FAIL_CLOSED | true | When trend or 52w-high distance is missing, the downtrend + falling-knife gates SKIP (can't confirm safety). RSI gate stays fail-open. Logs `[TREND DATA MISSING]`. Set false to restore legacy fail-open. |
 | MAX_POSITIONS | 5 | Max concurrent positions |
 | DAILY_LOSS_LIMIT_PCT | 2% | Circuit breaker threshold |
 | ENTRY_RETRACE_THRESHOLD | 0.6 | Skip if 40%+ of move already retraced |
@@ -246,9 +249,13 @@ Self-skips on weekends and when fewer than `MIN_TRADES_FOR_ANALYSIS = 5` trades 
 | FORCED_REEVAL_LOSS_PCT | 1.5% | Bypass news-fingerprint skip and force a Gemini re-look when P&L drops below this |
 | **Gemini-driven limits (hard floors/ceilings)** | | |
 | GEMINI_TP_MIN / GEMINI_TP_MAX | 5% / 50% | Take-profit range Gemini can set |
-| GEMINI_SL_MIN / GEMINI_SL_MAX | 2% / 10% | Stop-loss range Gemini can set |
-| ATR_SL_MULTIPLIER | 0.5 | SL must cover at least this × daily ATR%; capped at GEMINI_SL_MAX |
+| GEMINI_SL_MIN / GEMINI_SL_MAX | 2% / 18% | Stop-loss range Gemini can set. Max raised 10% → 18% so the ATR floor isn't immediately reclamped on high-ATR names. |
+| ATR_SL_MULTIPLIER | 1.5 | SL must cover at least this × daily ATR%; capped at GEMINI_SL_MAX. Raised 0.5 → 1.5 — a half-ATR stop gets hit by ordinary noise. |
+| RISK_PER_TRADE_PCT | 0.005 | Constant fractional-risk sizing: caps `position_size_pct` to `RISK_PER_TRADE_PCT / stop_loss_pct` so dollar risk at stop ≤ 0.5% of equity. Only ever reduces the Gemini-set size. |
+| MIN_RR_RATIO | 2.0 | Final TP lifted to `max(TP, SL × MIN_RR_RATIO)`. If `SL × MIN_RR_RATIO > GEMINI_TP_MAX`, the trade is SKIPPED (`[RR UNMET]`) rather than shipped at degraded RR — keeps the reward:risk floor real, doesn't silently clamp it away. |
 | GEMINI_SIZE_MIN / GEMINI_SIZE_MAX | 2% / 12% | Position size range Gemini can set |
+| BIOTECH_POSITION_SIZE_PCT | 0.05 | Hard cap applied by `trader._apply_biotech_cap`. Binds when `sector ∈ BIOTECH_SECTORS` OR `is_biotech` (the `is_biotech_catalyst(news)` flag). FDA names gap through stops — was a soft Gemini-prompt hint, now enforced in code. |
+| BIOTECH_SECTORS | `{"biotech"}` | Sector strings (from `news.determine_sector`) that trigger the biotech size cap. The function's value set is `{"tech", "biotech", "energy", "financials", "unknown"}`; only `"biotech"` qualifies by default. Add `"healthcare"` etc. if future labels are introduced. The OR-`is_biotech` path covers the case where a non-biotech-mapped ticker fires on an FDA catalyst. |
 | GEMINI_HOLD_MIN / GEMINI_HOLD_MAX | 30 / 390min | Hold time range Gemini can set |
 | SHORT_INTEREST_CACHE_HOURS | 4h | yfinance short interest cache TTL |
 | ESTIMATE_REVISION_CACHE_HOURS | 6h | Finnhub estimate revisions cache TTL |

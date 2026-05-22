@@ -1,6 +1,6 @@
 # HANDOFF — Trading Bot
 
-Last updated: 2026-05-11
+Last updated: 2026-05-22
 
 This file is the running operational record for the bot. CLAUDE.md is for
 agents working on the code; HANDOFF.md is for the human (or next agent)
@@ -9,6 +9,54 @@ who picks up where the last session left off.
 ---
 
 ## What Was Built
+
+### 2026-05-22 — entry/risk hardening (uncommitted, staged)
+
+Three coupled changes in one branch, staged but not yet committed:
+
+1. **ATR-anchored stops + risk-based sizing.** `ATR_SL_MULTIPLIER` raised
+   0.5 → 1.5; `GEMINI_SL_MAX` raised 0.10 → 0.18; new `RISK_PER_TRADE_PCT`
+   (default 0.005) caps `position_size_pct` to `RISK_PER_TRADE_PCT /
+   stop_loss_pct` so dollar risk at stop ≤ 0.5% of equity. New
+   `MIN_RR_RATIO` (default 2.0); trade SKIPPED (no cooldown, log
+   `[RR UNMET]`) when `stop_loss_pct × MIN_RR_RATIO > GEMINI_TP_MAX`
+   instead of silently clamping TP down.
+2. **Trend gates fail CLOSED.** `RSI_MAX_ENTRY` (renamed from
+   `MAX_ENTRY_RSI`) lowered 82 → 72; new `REJECT_DOWNTREND` and
+   `FALLING_KNIFE_DRAWDOWN_PCT` gates; new `TREND_GATE_FAIL_CLOSED`
+   (default True) makes the downtrend + falling-knife gates skip when
+   trend or 52w-high distance is missing (logs `[TREND DATA MISSING]`).
+   RSI gate stays fail-open.
+3. **Biotech 5% size cap, now hard-enforced (with leak closed).**
+   Previously `BIOTECH_POSITION_SIZE_PCT=0.05` was defined but never read
+   — the only "cap" was a Gemini-prompt hint at `scorer.py:118` which the
+   model ignored. New `trader._apply_biotech_cap` and
+   `config.BIOTECH_SECTORS` (`frozenset({"biotech"})`) clamp position
+   size to 5%. The cap binds when EITHER `sector ∈ BIOTECH_SECTORS` OR
+   `is_biotech` is True (the `is_biotech_catalyst(news)` flag already
+   threaded through `_do_execute_buy`). The OR closes the leak where
+   `news.determine_sector()` short-circuits to the static `_SECTOR_MAP`
+   before checking the FDA-news fallback — a tech-mapped ticker firing
+   on an FDA event would otherwise escape the cap.
+   `[BIOTECH CAP]` logs include a `trigger=…` tag with three possible
+   values: `sector` (the static `_SECTOR_MAP` matched), `news` (only
+   `is_biotech_catalyst(news)` matched — the leak path), or `sector+news`
+   (both matched). Use the tag when triaging cap fires in `journalctl`
+   to know which signal caught the trade. Sector-concentration logic is
+   deliberately not tied to `is_biotech` (different question: bucket vs.
+   gap-risk). Sector `"unknown"` with no FDA flag remains uncapped
+   (fail-safe — `[BIOTECH SECTOR UNKNOWN]` at DEBUG).
+
+All sizing helpers (`_apply_atr_floor`, `_apply_risk_cap`,
+`_apply_rr_floor`, `_should_skip_unmet_rr`, `_apply_biotech_cap`) are
+pure functions in `trader.py`; entry gates (`_should_skip_overbought`,
+`_should_skip_downtrend`, `_should_skip_falling_knife`) are pure
+functions in `bot.py`. Composition order in `_do_execute_buy`:
+Gemini-clamp SL → ATR floor → `_should_skip_unmet_rr` → `_apply_rr_floor`
+→ Gemini-clamp size → `_apply_biotech_cap` → `_apply_risk_cap`. Both
+sizing caps compose as pure MINs — order-independent, tightest wins.
+
+`tests/test_core.py` grew from 25 to 85 tests; all green.
 
 ### 2026-05-11 — critical production fixes (zero-trades incident resolved)
 

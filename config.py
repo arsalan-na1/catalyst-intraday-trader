@@ -131,11 +131,31 @@ MIN_GEMINI_CONFIDENCE_EARNINGS = _int("MIN_GEMINI_CONFIDENCE_EARNINGS", 6)
 MIN_GEMINI_MAGNITUDE = _int("MIN_GEMINI_MAGNITUDE", 7)
 
 # Hard RSI ceiling: bot rejects entries when technicals report RSI above
-# this value, regardless of Gemini's verdict. Gemini's system prompt already
-# says RSI > 85 → should_trade=False, but the model has been observed
-# overriding its own rule, so this is a bot-side floor. Fail open when
-# technicals are unavailable.
-MAX_ENTRY_RSI = _int("MAX_ENTRY_RSI", 82)
+# this value, regardless of Gemini's verdict. Tightened from 82 → 72 so we
+# stop buying late-stage breakouts that have already exhausted the move.
+# Gemini's system prompt already says RSI > 85 → should_trade=False, but the
+# model has been observed overriding its own rule, so this is a bot-side
+# floor. Fail open when technicals are unavailable.
+RSI_MAX_ENTRY = _int("RSI_MAX_ENTRY", 72)
+
+# Trend filter: skip entries when the daily trend is "downtrend" (price below
+# SMA50 AND SMA50 below SMA200). Catches the obvious "bottom-fishing into a
+# falling stock" mistake before Gemini's catalyst-bias can override technicals.
+REJECT_DOWNTREND = _bool("REJECT_DOWNTREND", True)
+
+# Falling-knife gate: skip when price is more than this fraction below the
+# 52-week high AND the trend is not "uptrend". The combination is the AREC
+# pattern (down 69% from highs, downtrend, RSI 48) — a stock that has been
+# punished hard and has not yet recovered, no matter how good the catalyst
+# headline looks.
+FALLING_KNIFE_DRAWDOWN_PCT = _float("FALLING_KNIFE_DRAWDOWN_PCT", 0.40)
+
+# When trend or 52-week-high distance is missing, fail CLOSED on the
+# downtrend and falling-knife gates — we can't confirm the stock is not a
+# falling knife, so don't trade it. The overbought (RSI) gate stays
+# fail-open because RSI absence is common and doesn't signal a hidden risk.
+# Set to False to restore the legacy fail-open behavior on these two gates.
+TREND_GATE_FAIL_CLOSED = _bool("TREND_GATE_FAIL_CLOSED", True)
 
 # --- Biotech catalyst fast-track ---
 # Raised from 4→6 to guard against binary FDA gap risk: rejection/CRL can
@@ -145,6 +165,18 @@ MAX_ENTRY_RSI = _int("MAX_ENTRY_RSI", 82)
 BIOTECH_GEMINI_CONFIDENCE = _int("BIOTECH_GEMINI_CONFIDENCE", 6)
 BIOTECH_GEMINI_MAGNITUDE = _int("BIOTECH_GEMINI_MAGNITUDE", 6)
 BIOTECH_POSITION_SIZE_PCT = _float("BIOTECH_POSITION_SIZE_PCT", 0.05)
+
+# Hard biotech size cap enforced in trader._apply_biotech_cap. When the
+# sector returned by news.determine_sector() falls in this set, the
+# position size is clamped down to BIOTECH_POSITION_SIZE_PCT regardless
+# of what Gemini set.
+#
+# The sector contract from news.determine_sector() is exactly one of:
+# {"tech", "biotech", "energy", "financials", "unknown"} — there is no
+# "healthcare" label. Pharma/biotech tickers in news._SECTOR_MAP all map
+# to "biotech". If a future sector label (e.g. "healthcare") is added,
+# include it here so the cap continues to apply.
+BIOTECH_SECTORS = frozenset({"biotech"})
 
 # --- Tiered circuit breakers ---
 # Daily DD > DAILY_LOSS_LIMIT_PCT → halve position sizes for rest of session.
@@ -190,7 +222,9 @@ MAX_HOLD_MINUTES = _int("MAX_HOLD_MINUTES", 90)
 GEMINI_TP_MIN   = _float("GEMINI_TP_MIN",   0.05)
 GEMINI_TP_MAX   = _float("GEMINI_TP_MAX",   0.50)
 GEMINI_SL_MIN   = _float("GEMINI_SL_MIN",   0.02)
-GEMINI_SL_MAX   = _float("GEMINI_SL_MAX",   0.10)
+# Raised 0.10 → 0.18 so the ATR floor (1.5× daily ATR) isn't immediately
+# clamped back down on high-ATR names — a 9% ATR stock needs a 13.5% stop.
+GEMINI_SL_MAX   = _float("GEMINI_SL_MAX",   0.18)
 GEMINI_SIZE_MIN = _float("GEMINI_SIZE_MIN", 0.02)
 GEMINI_SIZE_MAX = _float("GEMINI_SIZE_MAX", 0.12)
 GEMINI_HOLD_MIN = _int("GEMINI_HOLD_MIN", 30)
@@ -198,10 +232,23 @@ GEMINI_HOLD_MAX = _int("GEMINI_HOLD_MAX", 390)
 
 # ATR-anchored stop-loss floor. After clamping Gemini's stop_loss_pct, the
 # trader enforces a minimum stop distance of ATR_SL_MULTIPLIER × daily ATR%
-# so a routine intraday wiggle doesn't stop the trade out. Capped at
-# GEMINI_SL_MAX so a very-volatile name doesn't end up with a wider-than-ceiling
-# stop.
-ATR_SL_MULTIPLIER = _float("ATR_SL_MULTIPLIER", 0.5)
+# so a routine intraday wiggle doesn't stop the trade out. Raised 0.5 → 1.5:
+# a tight half-ATR stop gets hit by ordinary noise on the same day. Capped
+# at GEMINI_SL_MAX so a very-volatile name doesn't end up with a
+# wider-than-ceiling stop.
+ATR_SL_MULTIPLIER = _float("ATR_SL_MULTIPLIER", 1.5)
+
+# Constant fractional-risk sizing: cap shares so the dollar loss at the stop
+# never exceeds RISK_PER_TRADE_PCT of equity. Equivalent to scaling
+# position_size_pct down to RISK_PER_TRADE_PCT / stop_loss_pct. Only ever
+# reduces the Gemini-set size — never increases it.
+RISK_PER_TRADE_PCT = _float("RISK_PER_TRADE_PCT", 0.005)
+
+# Reward-to-risk floor. After the final stop_loss_pct (including ATR floor),
+# the trader lifts take_profit_pct to at least stop_loss_pct × MIN_RR_RATIO
+# (then reclamps to GEMINI_TP_MAX). Keeps the setup's RR intact when the ATR
+# floor widens the stop.
+MIN_RR_RATIO = _float("MIN_RR_RATIO", 2.0)
 
 # --- Concurrency / rate limiting ---
 GEMINI_CONCURRENCY = _int("GEMINI_CONCURRENCY", 2)

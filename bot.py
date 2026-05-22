@@ -87,6 +87,59 @@ async def _fetch_current_price(
         return None
 
 
+# ---------------------------------------------------------------------------
+# Pure entry-gate helpers (no I/O) — unit-tested.
+# Each returns True iff the trigger should be skipped (no order, no cooldown).
+#
+# Fail-mode policy:
+#   - _should_skip_overbought  → fails OPEN on missing RSI (RSI absence is
+#     common and doesn't itself signal hidden risk).
+#   - _should_skip_downtrend   → fails CLOSED by default (TREND_GATE_FAIL_CLOSED).
+#   - _should_skip_falling_knife → fails CLOSED by default.
+# Rationale: a missing trend label or 52w-high distance means we cannot
+# confirm the stock is NOT a falling knife; defaulting to skip is the safer
+# posture. Toggle TREND_GATE_FAIL_CLOSED=false in .env to restore the legacy
+# fail-open behavior.
+# ---------------------------------------------------------------------------
+
+def _should_skip_overbought(rsi_14: float | None, rsi_max: int) -> bool:
+    return rsi_14 is not None and rsi_14 > rsi_max
+
+
+def _should_skip_downtrend(
+    trend: str | None,
+    reject_downtrend: bool,
+    *,
+    fail_closed: bool = True,
+) -> bool:
+    if not reject_downtrend:
+        return False
+    if not trend:  # None or empty string
+        return fail_closed
+    return trend == "downtrend"
+
+
+def _should_skip_falling_knife(
+    trend: str | None,
+    dist_from_52w_high_pct: float | None,
+    drawdown_threshold_pct: float,
+    *,
+    fail_closed: bool = True,
+) -> bool:
+    """Reject deep-drawdown names that have not yet recovered.
+
+    dist_from_52w_high_pct is signed and **negative** when below the high
+    (matches technicals.dist_from_52w_high_pct). Trigger when the drawdown
+    exceeds drawdown_threshold_pct AND the trend is not "uptrend". When
+    either input is missing, return `fail_closed` (default True) — we can't
+    confirm the stock is not a knife without the data.
+    """
+    if dist_from_52w_high_pct is None or not trend:
+        return fail_closed
+    drawdown = -dist_from_52w_high_pct / 100.0  # convert -69.0 → 0.69
+    return drawdown > drawdown_threshold_pct and trend != "uptrend"
+
+
 async def _process_trigger(
     event: TriggerEvent,
     scorer: Scorer,
@@ -210,17 +263,63 @@ async def _process_trigger(
             )
             return
 
-        # Hard RSI ceiling gate. Gemini's system prompt says RSI > 85 →
-        # should_trade=False, but the model has been observed entering
-        # severely overbought names anyway (INTC RSI 86 on 2026-05-07).
-        # Fail open when technicals are unavailable.
-        if (ctx.technicals is not None
-                and ctx.technicals.rsi_14 is not None
-                and ctx.technicals.rsi_14 > config.MAX_ENTRY_RSI):
+        # --- Technical entry gates ---
+        # All three skip the trade without setting a cooldown — a follow-on
+        # trigger remains eligible if the technicals subsequently improve.
+        # The RSI gate fails OPEN on missing data; the two trend gates fail
+        # CLOSED by default (TREND_GATE_FAIL_CLOSED).
+        tech = ctx.technicals
+
+        # 1) Hard RSI ceiling. Fail-open: only runs when technicals & RSI exist.
+        # Gemini occasionally enters severely overbought names despite its own
+        # prompt rule (INTC RSI 86 on 2026-05-07). Tightened to RSI_MAX_ENTRY (72).
+        if tech is not None and _should_skip_overbought(tech.rsi_14, config.RSI_MAX_ENTRY):
             log.info(
-                "[RSI GATE] %s skipped — RSI %.0f > MAX_ENTRY_RSI %d",
-                event.ticker, ctx.technicals.rsi_14, config.MAX_ENTRY_RSI,
+                "[RSI OVERBOUGHT] %s skipped — RSI %.0f > RSI_MAX_ENTRY %d",
+                event.ticker, tech.rsi_14, config.RSI_MAX_ENTRY,
             )
+            return
+
+        # 2) Downtrend filter. Fail-closed: missing trend = can't confirm safety.
+        if _should_skip_downtrend(
+            tech.trend if tech is not None else None,
+            config.REJECT_DOWNTREND,
+            fail_closed=config.TREND_GATE_FAIL_CLOSED,
+        ):
+            trend_val = tech.trend if tech is not None else None
+            if not trend_val:
+                log.info(
+                    "[TREND DATA MISSING] %s skipped — downtrend gate fail-closed",
+                    event.ticker,
+                )
+            else:
+                log.info(
+                    "[DOWNTREND SKIP] %s skipped — trend=%s (REJECT_DOWNTREND on)",
+                    event.ticker, trend_val,
+                )
+            return
+
+        # 3) Falling-knife: deep drawdown from 52w high without an uptrend in
+        # place. The AREC pattern: -69% from highs, downtrend, RSI 48 — never
+        # should have filled. Fail-closed: missing trend or 52w distance = skip.
+        if _should_skip_falling_knife(
+            tech.trend if tech is not None else None,
+            tech.dist_from_52w_high_pct if tech is not None else None,
+            config.FALLING_KNIFE_DRAWDOWN_PCT,
+            fail_closed=config.TREND_GATE_FAIL_CLOSED,
+        ):
+            trend_val = tech.trend if tech is not None else None
+            dist_val = tech.dist_from_52w_high_pct if tech is not None else None
+            if dist_val is None or not trend_val:
+                log.info(
+                    "[TREND DATA MISSING] %s skipped — falling-knife gate fail-closed",
+                    event.ticker,
+                )
+            else:
+                log.info(
+                    "[FALLING KNIFE] %s skipped — %.0f%% from 52w high, trend=%s",
+                    event.ticker, dist_val, trend_val,
+                )
             return
 
         if is_premarket:

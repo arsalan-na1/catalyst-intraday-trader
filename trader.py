@@ -100,6 +100,123 @@ def _calc_take_profit(magnitude: int) -> float | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Pure entry-sizing helpers (no I/O, no Alpaca, no logging) — unit-tested.
+# ---------------------------------------------------------------------------
+
+def _apply_atr_floor(
+    stop_loss_pct: float,
+    atr_14_pct: float | None,
+    atr_multiplier: float,
+    sl_max: float,
+) -> float:
+    """Widen stop_loss_pct to ATR_SL_MULTIPLIER × daily ATR%, capped at sl_max.
+
+    atr_14_pct is in percentage units (e.g. 9.0 = 9%). Returns the original
+    stop unchanged when ATR is unavailable.
+    """
+    if atr_14_pct is None or atr_14_pct <= 0:
+        return stop_loss_pct
+    atr_floor = (atr_14_pct / 100.0) * atr_multiplier
+    return min(max(stop_loss_pct, atr_floor), sl_max)
+
+
+def _apply_risk_cap(
+    position_size_pct: float,
+    risk_per_trade_pct: float,
+    stop_loss_pct: float,
+    size_min: float,
+) -> float:
+    """Cap position_size_pct so dollar risk at stop ≤ risk_per_trade_pct of equity.
+
+    Mathematically: dollar_risk = size_pct × stop_loss_pct × equity. We want
+    dollar_risk ≤ risk_per_trade_pct × equity, so size_pct ≤
+    risk_per_trade_pct / stop_loss_pct. Equivalent to taking the MIN of the
+    Gemini-derived share count and `floor(equity × risk / (price × sl))`.
+
+    Only ever reduces — never increases — the input size. Floored at size_min
+    so we don't fall below the broker's minimum allocation.
+    """
+    if stop_loss_pct <= 0:
+        return position_size_pct
+    risk_implied = risk_per_trade_pct / stop_loss_pct
+    if risk_implied >= position_size_pct:
+        return position_size_pct
+    return max(size_min, risk_implied)
+
+
+def _apply_rr_floor(
+    take_profit_pct: float,
+    stop_loss_pct: float,
+    min_rr_ratio: float,
+    tp_max: float,
+) -> float:
+    """Lift take_profit_pct so TP/SL ≥ min_rr_ratio, then reclamp to tp_max.
+
+    When the ATR floor widens the stop, this keeps the setup's reward-to-risk
+    intact rather than leaving a sub-1:1 trade in place. **Only call this
+    after `_should_skip_unmet_rr` has confirmed the required TP fits under
+    tp_max** — otherwise the reclamp silently degrades RR.
+    """
+    rr_floor = stop_loss_pct * min_rr_ratio
+    return min(max(take_profit_pct, rr_floor), tp_max)
+
+
+def _should_skip_unmet_rr(
+    stop_loss_pct: float,
+    gemini_tp_max: float,
+    min_rr_ratio: float,
+) -> bool:
+    """Return True when the required TP for MIN_RR_RATIO won't fit under tp_max.
+
+    When ATR widens the stop past `gemini_tp_max / min_rr_ratio`, the only
+    way to honor the RR floor would be to ship a TP above the hard cap.
+    `_apply_rr_floor` would silently reclamp it down and the trade would
+    ship at sub-MIN_RR_RATIO reward:risk. Filter the trade out instead —
+    a stock that needs an 18% stop but only offers TP_MAX upside is a bad
+    setup, not one to downsize into.
+    """
+    return stop_loss_pct * min_rr_ratio > gemini_tp_max
+
+
+def _apply_biotech_cap(
+    position_size_pct: float,
+    sector: str | None,
+    biotech_sectors: frozenset[str],
+    biotech_cap_pct: float,
+    *,
+    is_biotech: bool = False,
+) -> float:
+    """Hard-cap position_size_pct when the trade is an FDA/biotech gap risk.
+
+    Binds when EITHER (a) `sector` is in `biotech_sectors` (the static
+    company-bucket mapping), OR (b) `is_biotech` is True (the news-side
+    catalyst flag from `is_biotech_catalyst(news)`). The OR closes a leak
+    where `news.determine_sector()` short-circuits to the static
+    `_SECTOR_MAP` before checking the FDA-news fallback, so a tech-mapped
+    ticker firing on an FDA event would otherwise escape the cap.
+
+    The two questions are different on purpose:
+      - sector  → "what bucket does this company live in?" (concentration)
+      - is_biotech → "is this trigger's catalyst gap-risk?" (sizing)
+    The cap cares about the second; sector-concentration cares about the
+    first. Keeping them separate avoids polluting sector telemetry with
+    news-driven relabelling.
+
+    Fail-safe preserved: `sector="unknown"` AND `is_biotech=False` → no cap.
+    The caller logs `[BIOTECH SECTOR UNKNOWN]` on that no-op path so misses
+    are visible at DEBUG.
+
+    Composes as a pure MIN with the risk cap — order independent.
+    """
+    # `None in frozenset(...)` and `"" in frozenset(...)` both return False
+    # without raising, so a plain `sector in biotech_sectors` is enough — no
+    # bool(sector) guard needed. Keeps the helper symmetric with the call site.
+    if not (sector in biotech_sectors or is_biotech):
+        return position_size_pct
+    return min(position_size_pct, biotech_cap_pct)
+
+
 @dataclass
 class ActivePosition:
     ticker: str
@@ -738,22 +855,102 @@ class Trader:
             min(config.GEMINI_SL_MAX, _safe_float(verdict.stop_loss_pct, 0.05)),
         )
 
-        # ATR floor: SL must cover at least ATR_SL_MULTIPLIER × daily ATR
-        # so we don't get stopped out by normal intraday noise.
-        if ctx.technicals is not None and ctx.technicals.atr_14_pct is not None:
-            atr_floor = ctx.technicals.atr_14_pct / 100.0 * config.ATR_SL_MULTIPLIER
-            if atr_floor > stop_loss_pct:
-                log.info(
-                    "[ATR FLOOR] %s SL raised from %.1f%% to %.1f%% (ATR=%.1f%% × %.1f)",
-                    ticker, stop_loss_pct * 100, atr_floor * 100,
-                    ctx.technicals.atr_14_pct, config.ATR_SL_MULTIPLIER,
-                )
-                stop_loss_pct = min(atr_floor, config.GEMINI_SL_MAX)
+        # ATR floor: SL must cover at least ATR_SL_MULTIPLIER × daily ATR so
+        # we don't get stopped out by normal intraday noise. Applied AFTER
+        # the Gemini SL clamp so the broader ceiling (GEMINI_SL_MAX) bounds it.
+        atr_pct = ctx.technicals.atr_14_pct if ctx.technicals is not None else None
+        sl_after_atr = _apply_atr_floor(
+            stop_loss_pct, atr_pct, config.ATR_SL_MULTIPLIER, config.GEMINI_SL_MAX,
+        )
+        if sl_after_atr > stop_loss_pct:
+            # _apply_atr_floor only widens when atr_pct > 0, so atr_pct is not None here.
+            log.info(
+                "[ATR FLOOR] %s SL raised from %.1f%% to %.1f%% (ATR=%.1f%% × %.1f)",
+                ticker, stop_loss_pct * 100, sl_after_atr * 100,
+                atr_pct, config.ATR_SL_MULTIPLIER,
+            )
+        stop_loss_pct = sl_after_atr
+
+        # RR-unmet gate: when the ATR-widened stop pushes the required TP
+        # above GEMINI_TP_MAX, the trade can't ship at MIN_RR_RATIO no matter
+        # how _apply_rr_floor reclamps. Filter — don't downsize into a bad
+        # reward:risk setup. No cooldown so a later trigger remains eligible.
+        if _should_skip_unmet_rr(stop_loss_pct, config.GEMINI_TP_MAX, config.MIN_RR_RATIO):
+            required_tp = stop_loss_pct * config.MIN_RR_RATIO
+            log.info(
+                "[RR UNMET] %s skipped — SL %.1f%% × %.1f RR needs TP %.1f%% > cap %.1f%%",
+                ticker, stop_loss_pct * 100, config.MIN_RR_RATIO,
+                required_tp * 100, config.GEMINI_TP_MAX * 100,
+            )
+            return False
+
+        # Reward-to-risk floor: a widened stop must come with a proportionally
+        # wider TP so the setup's RR stays intact. Safe to clamp to TP_MAX
+        # now because _should_skip_unmet_rr above guaranteed the floor fits.
+        tp_after_rr = _apply_rr_floor(
+            take_profit_pct, stop_loss_pct, config.MIN_RR_RATIO, config.GEMINI_TP_MAX,
+        )
+        if tp_after_rr > take_profit_pct:
+            log.info(
+                "[RR FLOOR] %s TP raised from %.1f%% to %.1f%% (SL=%.1f%% × %.1f)",
+                ticker, take_profit_pct * 100, tp_after_rr * 100,
+                stop_loss_pct * 100, config.MIN_RR_RATIO,
+            )
+        take_profit_pct = tp_after_rr
 
         position_size_pct = max(
             config.GEMINI_SIZE_MIN,
             min(config.GEMINI_SIZE_MAX, _safe_float(verdict.position_size_pct, 0.10)),
         )
+
+        # Hard biotech size cap. FDA/biotech names gap through stops on
+        # binary catalysts (CRL, AdCom, PDUFA reject) — the Gemini-prompt
+        # hint was being ignored, so cap in code. Binds when EITHER the
+        # static sector mapping returns biotech OR is_biotech (the news-
+        # catalyst flag) is True. The OR closes a leak where a tech-mapped
+        # ticker firing on an FDA event would otherwise escape the cap.
+        # Fail-safe: unknown sector AND no FDA news flag → no cap.
+        sector_match = sector in config.BIOTECH_SECTORS
+        if sector_match or is_biotech:
+            size_after_biotech = _apply_biotech_cap(
+                position_size_pct, sector,
+                config.BIOTECH_SECTORS, config.BIOTECH_POSITION_SIZE_PCT,
+                is_biotech=is_biotech,
+            )
+            if size_after_biotech < position_size_pct:
+                reason = (
+                    "sector+news" if (sector_match and is_biotech)
+                    else "sector" if sector_match
+                    else "news"  # is_biotech only — the leak case
+                )
+                log.info(
+                    "[BIOTECH CAP] %s size %.1f%%→%.1f%% (trigger=%s sector=%s cap=%.1f%%)",
+                    ticker, position_size_pct * 100, size_after_biotech * 100,
+                    reason, sector, config.BIOTECH_POSITION_SIZE_PCT * 100,
+                )
+            position_size_pct = size_after_biotech
+        elif not sector or sector == "unknown":
+            log.debug(
+                "[BIOTECH SECTOR UNKNOWN] %s sector=%r is_biotech=%s — biotech cap not applied (fail-safe)",
+                ticker, sector, is_biotech,
+            )
+
+        # Constant fractional-risk sizing: cap shares so the dollar loss at the
+        # stop never exceeds RISK_PER_TRADE_PCT × equity. Equivalent to taking
+        # the MIN of the Gemini-derived share count and
+        # floor(equity × RISK / (price × stop_loss_pct)) — only ever reduces.
+        # Composes with the biotech cap above as a pure MIN: order independent,
+        # tightest wins.
+        size_after_risk = _apply_risk_cap(
+            position_size_pct, config.RISK_PER_TRADE_PCT, stop_loss_pct, config.GEMINI_SIZE_MIN,
+        )
+        if size_after_risk < position_size_pct:
+            log.info(
+                "[RISK CAP] %s size %.1f%%→%.1f%% (risk %.2f%% / sl %.1f%%)",
+                ticker, position_size_pct * 100, size_after_risk * 100,
+                config.RISK_PER_TRADE_PCT * 100, stop_loss_pct * 100,
+            )
+        position_size_pct = size_after_risk
         max_hold_minutes  = max(config.GEMINI_HOLD_MIN, min(config.GEMINI_HOLD_MAX, verdict.max_hold_minutes))
         hold_strategy     = verdict.hold_strategy
 
