@@ -299,7 +299,7 @@ def test_will_score_call_model_mirrors_score_guards():
     assert s.will_score_call_model(ctx) is False           # cooldown → no call
     s._last_scored.clear()
 
-    s._cache[ctx.ticker] = (datetime.now(timezone.utc), object())
+    s._cache[ctx.ticker] = (datetime.now(timezone.utc), object(), None)  # (cached_at, verdict, tech)
     assert s.will_score_call_model(ctx) is False           # cache hit → no call
 
 

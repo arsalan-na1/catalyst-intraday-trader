@@ -410,8 +410,12 @@ class Scorer:
         # Separate semaphore for position re-evaluation so open-position scoring
         # never queues behind new-entry scoring (and vice versa).
         self._position_sem = asyncio.Semaphore(config.POSITION_EVAL_SEMAPHORE_LIMIT)
-        # verdict cache: ticker -> (cached_at, verdict)
-        self._cache: dict[str, tuple[datetime, CatalystVerdict]] = {}
+        # verdict cache: ticker -> (cached_at, verdict, tech). The technicals
+        # the verdict was scored with are cached alongside it (B2) so a
+        # cache-served re-trigger feeds the post-score trend / falling-knife
+        # gates real data instead of None — None fails those gates closed
+        # (TREND_GATE_FAIL_CLOSED) and silently dropped otherwise-valid trades.
+        self._cache: dict[str, tuple[datetime, CatalystVerdict, Technicals | None]] = {}
         # call counters (reset by caller at session boundary if desired)
         self.calls_today: int = 0
         self.calls_grounded: int = 0    # scoring events that used Google Search grounding
@@ -631,20 +635,24 @@ class Scorer:
     # ingestion API importable from this codebase. If/when one ships, forward
     # (model, prompt_tok, out_tok, real_cost) from _account_usage to it here.
 
-    def _cache_get(self, ticker: str) -> CatalystVerdict | None:
+    def _cache_get(
+        self, ticker: str
+    ) -> tuple[CatalystVerdict, Technicals | None] | None:
         entry = self._cache.get(ticker)
         if entry is None:
             return None
-        cached_at, verdict = entry
+        cached_at, verdict, tech = entry
         age_min = (datetime.now(timezone.utc) - cached_at).total_seconds() / 60.0
         if age_min < config.VERDICT_CACHE_MINUTES:
             log.info("[CACHE HIT] %s verdict %.0f min old; reusing", ticker, age_min)
-            return verdict
+            return verdict, tech
         del self._cache[ticker]
         return None
 
-    def _cache_put(self, ticker: str, verdict: CatalystVerdict) -> None:
-        self._cache[ticker] = (datetime.now(timezone.utc), verdict)
+    def _cache_put(
+        self, ticker: str, verdict: CatalystVerdict, tech: Technicals | None = None
+    ) -> None:
+        self._cache[ticker] = (datetime.now(timezone.utc), verdict, tech)
 
     def _check_hourly_limit(self) -> bool:
         """Return True if we have headroom under the hourly API call cap.
@@ -972,7 +980,7 @@ class Scorer:
             return False
         entry = self._cache.get(ctx.ticker)
         if entry is not None:
-            cached_at, _ = entry
+            cached_at, _, _ = entry
             age_min = (datetime.now(timezone.utc) - cached_at).total_seconds() / 60.0
             if age_min < config.VERDICT_CACHE_MINUTES:
                 return False
@@ -1009,7 +1017,12 @@ class Scorer:
         precomputed_tech = tech
         cached = self._cache_get(ctx.ticker)
         if cached is not None:
-            return cached, None, {}
+            # B2: return the technicals cached alongside the verdict so the
+            # caller's post-score trend / falling-knife gates evaluate on real
+            # data — returning None here failed those gates closed and dropped
+            # otherwise-valid re-triggers inside the cache window.
+            cached_verdict, cached_tech = cached
+            return cached_verdict, cached_tech, {}
 
         # 30-minute per-ticker scoring cooldown (Opt 1): prevents spending Gemini
         # calls on rapid re-triggers of the same ticker.
@@ -1133,7 +1146,7 @@ class Scorer:
                 # calls_ungrounded already incremented inside _score_without_grounding
 
         if verdict is not None:
-            self._cache_put(ctx.ticker, verdict)
+            self._cache_put(ctx.ticker, verdict, tech)
             self._last_scored[ctx.ticker] = now_mono
         return verdict, tech, quant_signals
 
