@@ -377,3 +377,21 @@ REFLECTION_PRUNE_DAYS               = _int("REFLECTION_PRUNE_DAYS", 180)
 REFLECTION_MAX_PER_TICKER_INJECTED  = _int("REFLECTION_MAX_PER_TICKER_INJECTED", 3)
 REFLECTION_MAX_GLOBAL_INJECTED      = _int("REFLECTION_MAX_GLOBAL_INJECTED", 5)
 REFLECTION_INJECTED_TOKEN_BUDGET    = _int("REFLECTION_INJECTED_TOKEN_BUDGET", 600)
+
+# --- Congressional-trade copy: shared data layer (off-by-default feature) ---
+# See docs/specs/congress-copy.md. The virtual copy portfolio (Phase 2) is
+# gated by CONGRESS_COPY_ENABLED; this Phase-1 block is just the data layer
+# (congress_trades.py), which is inert until that portfolio is wired in.
+#
+# An FMP free-tier key enables full House+Senate coverage. Leave it BLANK to run
+# keyless on the Senate Stock Watcher fallback (Senate-only). To turn on full
+# coverage later, paste your free FMP key into .env as CONGRESS_DATA_API_KEY=...
+CONGRESS_DATA_API_KEY        = os.getenv("CONGRESS_DATA_API_KEY", "")
+CONGRESS_TRADES_FILE         = STATE_DIR / "congress_trades.json"
+CONGRESS_FMP_BASE_URL        = os.getenv("CONGRESS_FMP_BASE_URL", "https://financialmodelingprep.com")
+CONGRESS_FMP_LIMIT           = _int("CONGRESS_FMP_LIMIT", 250)
+CONGRESS_SENATE_FALLBACK_URL = os.getenv(
+    "CONGRESS_SENATE_FALLBACK_URL",
+    "https://raw.githubusercontent.com/timothycarambat/"
+    "senate-stock-watcher-data/master/aggregate/all_transactions.json",
+)
