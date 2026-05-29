@@ -13,7 +13,7 @@ python3 -m py_compile bot.py stream.py news.py scorer.py technicals.py trader.py
     fundamentals.py finnhub_data.py reddit_sentiment.py premarket_scanner.py \
     short_interest.py estimate_revisions.py sector_momentum.py market_regime.py
 
-# Run unit tests (21 tests covering pure functions — added 2026-05-07 third session)
+# Run unit tests (130 tests: pure functions in test_core.py + mocked scorer/cost/entry-gate suites)
 python -m pytest tests/ -v
 
 # End-to-end pipeline test (works outside market hours; skips real stream)
@@ -49,7 +49,7 @@ ssh aso@192.168.1.183 "cat ~/trading-bot/state/trade_log.jsonl"
 ssh aso@192.168.1.183 "cat ~/trading-bot/state/open_positions.json"
 ```
 
-All config is in `.env` (see `.env.example`). Two automated checks: `python3 -m py_compile` (syntax) and `python -m pytest tests/` (21 unit tests over pure functions). Run both on any change before considering work done.
+All config is in `.env` (see `.env.example`). Two automated checks: `python3 -m py_compile` (syntax) and `python -m pytest tests/` (130 unit tests: pure functions plus mocked scorer/cost-accounting/entry-gate suites). Run both on any change before considering work done.
 
 ---
 
@@ -61,7 +61,7 @@ All config is in `.env` (see `.env.example`). Two automated checks: `python3 -m 
 - **Pi IP:** 192.168.1.183, user: `aso`
 - **Bot directory:** `/home/aso/trading-bot/`
 - **Alpaca:** paper trading, IEX data feed (`ALPACA_PAPER=true`)
-- **Gemini:** google-genai SDK, grounded research mode
+- **Gemini:** google-genai SDK, single structured-verdict call (no grounding)
 - **Telegram bot:** @SBSPTbot
 
 ---
@@ -83,23 +83,29 @@ Alpaca WebSocket (stream.py TriggerDetector)
 
 The stream runs `StockDataStream.run()` in a worker thread (`asyncio.to_thread`). `TriggerDetector` posts events to the main loop's queue via `main_loop.call_soon_threadsafe`. This cross-loop hand-off is the only safe way to write to shared state from the stream thread.
 
-### Two-stage Gemini scoring (scorer.py)
+### Single-call Gemini scoring (scorer.py)
 
-Google Search grounding is incompatible with `response_schema` in a single call. Scoring always requires two API calls:
-1. **Research call** — `tools=[google_search]`, free-form text, no schema. Uses `_MODEL_RESEARCH` (default `gemini-2.5-flash`).
-2. **Verdict call** — `response_schema=CatalystVerdict`, no tools. Uses `_MODEL_VERDICT` (default `gemini-2.5-flash-lite`, ~5× cheaper output tokens).
+Scoring is a **single** Gemini call — `response_schema=CatalystVerdict`, no tools — using `_MODEL_VERDICT` (default `gemini-2.5-flash-lite`). It runs through `_verdict_from_research`.
 
-Both count toward the shared `RateLimiter` (15 RPM). Entry scoring uses `_sem`; open-position re-evaluation uses `_position_sem` (separate so re-evals never queue behind new entries).
+> **History:** there used to be a leading "research" call (`tools=[google_search]`, `gemini-2.5-flash`) whose free-form output was passed to the verdict prompt. The verdict prompt **never actually inserted that text**, so the grounded call (the priciest in the pipeline) was pure cost with zero effect on decisions. It was removed, along with `_research_with_grounding`, `_build_research_prompt`, `_RESEARCH_SYSTEM_INSTRUCTION`, `_MODEL_RESEARCH`, and `GEMINI_MODEL_RESEARCH`. `score()` still keeps a "strong vs weak" signal split (`GROUNDING_VOL_THRESHOLD` / `GROUNDING_PRICE_THRESHOLD`), but both buckets now make the same single verdict call — the split only selects which telemetry counter (`calls_grounded` vs `calls_ungrounded`) increments.
 
-### Monthly Gemini budget cap (scorer.py)
+The call counts toward the shared `RateLimiter` (15 RPM). Entry scoring uses `_sem`; open-position re-evaluation uses `_position_sem` (separate so re-evals never queue behind new entries). `score()` accepts an optional `tech=` kwarg so the caller's pre-Gemini gate technicals are reused (no double fetch) — see *Pre-Gemini reject gate* below.
 
-`Scorer._record_call_cost(is_grounded: bool)` is invoked inside `_research_with_grounding`, `_verdict_from_research`, and `score_open_position` before each Gemini API call. Adds the per-call cost (config: `GEMINI_COST_PER_GROUNDED_CALL` / `GEMINI_COST_PER_UNGROUNDED_CALL`) to `scorer.monthly_cost_estimate`.
+### Monthly Gemini budget cap — real token accounting (scorer.py)
 
-State machine:
-- `normal` → `ungrounded_only` at ≥80% of `MONTHLY_GEMINI_BUDGET_USD` (skips Google Search grounding for the rest of the month).
-- `ungrounded_only` → `halted` at ≥100% (all Gemini calls return early; bot continues on TP/SL/timeout rules only).
+Cost is now measured from **real token usage**, not a flat per-call guess:
+- `compute_gemini_cost(model, prompt_tokens, output_tokens, grounded_queries=)` prices a call from `config.GEMINI_TOKEN_PRICING` ($/1M tokens). Grounding is billed only when `GEMINI_GROUNDING_COST_PER_1K` is non-zero (default 0 — the grounded call is gone anyway).
+- `Scorer._record_call_cost(is_grounded)` runs **before** each call as a conservative flat *reservation* (gates the budget, drives the state machine). `Scorer._account_usage(model, response, …)` runs **after** each call: it reads `response.usage_metadata`, computes the real cost, and reconciles `monthly_cost_estimate` (subtracts the reservation, adds the real cost). It also accumulates a per-day, per-model breakdown in `scorer.usage_by_model`. Wired into every Gemini call site (verdict, `score_open_position`, reflection, self-improvement, startup ping).
 
-`scorer._alert_callback` is set from `bot.py` to push a Telegram message on each transition. `monthly_cost_estimate` and current month string are saved at the top level of `performance.json`; `bot.py` loads them on startup if the stored month matches the current month. The 1st-of-month reset happens inside `run_daily_summary`.
+### Pre-Gemini reject gate (bot._process_trigger)
+
+The deterministic technical reject gates (RSI ceiling, downtrend, falling-knife) run **before** the Gemini scoring call so a doomed candidate never incurs the cost. Flow: when `scorer.will_score_call_model(ctx)` is True (i.e. score() would make a real billable call — not a verdict-cache / 30-min-cooldown / halted hit), `bot._process_trigger` calls `scorer.fetch_technicals(ctx)`, runs `bot._technically_rejected(tech)`, and on reject calls `scorer.note_scored(ticker)` (starts the 30-min cooldown so re-triggers are suppressed) and returns — no Gemini call. The surviving technicals are passed to `score(tech=…)` to avoid a second fetch.
+
+The **post-score** inline gates in `_process_trigger` are deliberately kept as the authority, so the set of candidates ultimately accepted/rejected is unchanged — only doomed *fresh* candidates skip the scoring call. (The pre-gate intentionally does **not** fire for cache/cooldown hits, so the existing verdict-cache behavior is preserved.)
+
+State machine: `normal` → `ungrounded_only` at ≥80% of `MONTHLY_GEMINI_BUDGET_USD` → `halted` at ≥100% (all Gemini calls return early; bot runs on TP/SL/timeout rules only). `scorer._alert_callback` pushes a Telegram message on each transition.
+
+**Persistence (drift-proof):** `monthly_cost_estimate` + month + today's `usage_by_model` are flushed to **`state/gemini_cost.json`** every `COST_PERSIST_SECONDS` (default 60s) by `run_cost_persister` (atomic tmp→rename), and also written into `performance.json` at the daily summary (`_append_performance(gemini_usage=…)`). On startup `restore_cost_state` reloads `gemini_cost.json` if it is for the current month (re-entering `ungrounded_only`/`halted`), so a mid-day restart resumes the true tally instead of drifting back to the last daily snapshot. The 1st-of-month reset happens inside `run_daily_summary`.
 
 ### Market regime detector (market_regime.py)
 
@@ -260,11 +266,13 @@ Self-skips on weekends and when fewer than `MIN_TRADES_FOR_ANALYSIS = 5` trades 
 | SHORT_INTEREST_CACHE_HOURS | 4h | yfinance short interest cache TTL |
 | ESTIMATE_REVISION_CACHE_HOURS | 6h | Finnhub estimate revisions cache TTL |
 | INSIDER_CACHE_HOURS | 12h | Finnhub insider transactions cache TTL |
-| GEMINI_MODEL_RESEARCH | gemini-2.5-flash | Model used for grounded research call |
-| GEMINI_MODEL_VERDICT | gemini-2.5-flash-lite | Model used for verdict / position-eval calls |
-| MONTHLY_GEMINI_BUDGET_USD | 30.0 | Monthly Gemini hard cost cap |
-| GEMINI_COST_PER_GROUNDED_CALL | 0.016 | Cost charged per grounded call |
-| GEMINI_COST_PER_UNGROUNDED_CALL | 0.002 | Cost charged per ungrounded call |
+| GEMINI_MODEL_VERDICT | gemini-2.5-flash-lite | Model used for the single verdict / position-eval call (the only scoring model; `GEMINI_MODEL_RESEARCH` was removed) |
+| MONTHLY_GEMINI_BUDGET_USD | 30.0 | Monthly Gemini hard cost cap (now driven by real token cost) |
+| GEMINI_TOKEN_PRICING | flash 0.30/2.50, flash-lite 0.10/0.40 | $/1M input/output per model — source of truth for real cost |
+| GEMINI_GROUNDING_COST_PER_1K | 0.0 | $/1k Search-grounding queries; 0 = under free quota. Real rate $35; grounding is currently unused |
+| GEMINI_COST_PER_GROUNDED_CALL | 0.016 | Flat pre-call **reservation** only (reconciled to real token cost post-call) |
+| GEMINI_COST_PER_UNGROUNDED_CALL | 0.002 | Flat pre-call **reservation** only (reconciled to real token cost post-call) |
+| COST_PERSIST_SECONDS | 60 | Interval for flushing the running cost tally to `state/gemini_cost.json` |
 | **Kronos secondary confirmation** | | |
 | USE_KRONOS | true | Toggle Kronos-mini gate after Gemini buy approval; false skips the lazy import |
 | KRONOS_MIN_PROB | 0.45 | Minimum continuation probability to allow the buy through |

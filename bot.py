@@ -39,7 +39,7 @@ from news import determine_sector, fetch_news, is_analyst_action, is_biotech_cat
 from kronos_scorer import get_continuation_prob
 from reflection_generator import ReflectionGenerator
 from reflection_store import ReflectionStore
-from scorer import Scorer, TriggerContext
+from scorer import Scorer, TriggerContext, persist_cost_state, restore_cost_state
 from self_improvement import run_nightly_analysis
 from stream import TriggerEvent, load_watchlist, prefetch_adv, prefetch_prev_close, run_stream
 from telegram_handler import TelegramHandler
@@ -140,6 +140,33 @@ def _should_skip_falling_knife(
     return drawdown > drawdown_threshold_pct and trend != "uptrend"
 
 
+def _technically_rejected(tech) -> bool:
+    """Combined deterministic technical reject check (Fix 3 pre-Gemini gate).
+
+    Mirrors the three authoritative inline gates in _process_trigger (RSI ceiling,
+    downtrend, falling-knife) using the same helpers and thresholds. Returns True
+    if any would reject. No logging here — the inline gates after score() remain
+    the source of truth and log the specific reason; this only decides whether to
+    skip the (priciest) scoring call for a fresh, doomed candidate.
+    """
+    if tech is not None and _should_skip_overbought(tech.rsi_14, config.RSI_MAX_ENTRY):
+        return True
+    if _should_skip_downtrend(
+        tech.trend if tech is not None else None,
+        config.REJECT_DOWNTREND,
+        fail_closed=config.TREND_GATE_FAIL_CLOSED,
+    ):
+        return True
+    if _should_skip_falling_knife(
+        tech.trend if tech is not None else None,
+        tech.dist_from_52w_high_pct if tech is not None else None,
+        config.FALLING_KNIFE_DRAWDOWN_PCT,
+        fail_closed=config.TREND_GATE_FAIL_CLOSED,
+    ):
+        return True
+    return False
+
+
 async def _process_trigger(
     event: TriggerEvent,
     scorer: Scorer,
@@ -205,7 +232,30 @@ async def _process_trigger(
             log.exception("news fetch failed for %s", event.ticker)
             news = []
 
-        verdict, tech, quant = await scorer.score(ctx, news)
+        # --- Pre-Gemini deterministic reject gate (Fix 3 — cost optimization) ---
+        # When score() would make a real (billable) Gemini call, fetch the
+        # technicals the gates need and skip the call for a candidate the
+        # authoritative gates below will reject anyway. Only fires for fresh
+        # candidates (not verdict-cache / cooldown / halted hits) so the
+        # post-score gates stay the source of truth and the accept/reject set
+        # is unchanged — only doomed fresh candidates skip the scoring call.
+        # The fetched technicals are handed to score(tech=...) to avoid a
+        # second fetch.
+        pre_tech = None
+        if scorer.will_score_call_model(ctx):
+            pre_tech = await scorer.fetch_technicals(ctx)
+            if _technically_rejected(pre_tech):
+                log.info(
+                    "[PRE-GEMINI SKIP] %s rejected by deterministic technical "
+                    "gate; skipping Gemini scoring call", event.ticker,
+                )
+                # Start the 30-min scoring cooldown so rapid re-triggers are
+                # suppressed exactly as before — the old flow set this cooldown
+                # when score() ran (and was then rejected by the same gate).
+                scorer.note_scored(event.ticker)
+                return
+
+        verdict, tech, quant = await scorer.score(ctx, news, tech=pre_tech)
         if tech is not None:
             stats.technicals_fetched += 1
         else:
@@ -514,6 +564,35 @@ async def run_regime_refresher(
             log.warning("regime refresh failed; keeping previous label", exc_info=True)
 
 
+async def run_cost_persister(scorer: Scorer, stop_event: asyncio.Event) -> None:
+    """Flush the running Gemini cost tally to disk every COST_PERSIST_SECONDS
+    (Fix 4) so a mid-day restart resumes the true accumulated value instead of
+    drifting back to the last daily-summary snapshot.
+
+    Writes only when the tally changed (cheap, atomic, off the trade path) and
+    flushes once more on shutdown. Never raises.
+    """
+    last_persisted: float | None = None
+    while not stop_event.is_set():
+        try:
+            await asyncio.wait_for(
+                stop_event.wait(), timeout=config.COST_PERSIST_SECONDS
+            )
+            # Shutdown: final flush so nothing accrued since the last tick is lost.
+            await asyncio.to_thread(
+                persist_cost_state, scorer, config.GEMINI_COST_STATE_FILE
+            )
+            return
+        except asyncio.TimeoutError:
+            pass
+        current = round(scorer.monthly_cost_estimate, 6)
+        if current != last_persisted:
+            await asyncio.to_thread(
+                persist_cost_state, scorer, config.GEMINI_COST_STATE_FILE
+            )
+            last_persisted = current
+
+
 async def run_nightly_self_improvement(scorer: Scorer, stop_event: asyncio.Event) -> None:
     """Run self-improvement once per day at 4:30 PM ET, after EOD close completes.
 
@@ -635,10 +714,14 @@ async def _startup_checks(
                     "⚠️ Gemini ping skipped — budget gate refused the call"
                 )
             else:
-                await scorer._client.aio.models.generate_content(
+                _ping_resp = await scorer._client.aio.models.generate_content(
                     model=config.GEMINI_MODEL_VERDICT,
                     contents="ping",
                     config=_genai_types.GenerateContentConfig(max_output_tokens=1),
+                )
+                # Real token accounting (Fix 2) — even the auth ping is metered.
+                scorer._account_usage(
+                    config.GEMINI_MODEL_VERDICT, _ping_resp, is_grounded=False
                 )
                 log.info("✅ Gemini API key valid")
         except Exception as e:
@@ -839,6 +922,13 @@ async def main() -> int:
     except Exception:
         log.warning("failed to load persisted monthly Gemini cost", exc_info=True)
 
+    # Fix 4: the incremental cost-state sidecar is fresher than the daily
+    # performance.json snapshot above — restore it last so a mid-day restart
+    # resumes the true accumulated tally (and re-enters halted/ungrounded_only).
+    await asyncio.to_thread(
+        restore_cost_state, scorer, config.GEMINI_COST_STATE_FILE
+    )
+
     telegram = TelegramHandler(config.TELEGRAM_BOT_TOKEN, config.TELEGRAM_CHAT_ID)
     cooldown_store = CooldownStore()
     await cooldown_store.load()
@@ -1008,6 +1098,11 @@ async def main() -> int:
         tasks.append(_supervise(
             "run_nightly_self_improvement",
             lambda: run_nightly_self_improvement(scorer, stop_event),
+            stop_event,
+        ))
+        tasks.append(_supervise(
+            "run_cost_persister",
+            lambda: run_cost_persister(scorer, stop_event),
             stop_event,
         ))
         try:

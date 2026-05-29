@@ -43,5 +43,12 @@ def setup_logging(log_dir: Path, level: int = logging.INFO) -> None:
     root.addHandler(stream_handler)
 
     # Quiet noisy libs.
-    for noisy in ("httpx", "urllib3", "websockets", "asyncio"):
+    for noisy in ("urllib3", "websockets", "asyncio"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
+    # httpx and python-telegram-bot embed the bot token in every Bot API URL
+    # (api.telegram.org/bot<TOKEN>/...). The app's own handlers redact it, but
+    # library-internal logs bypass that — raise these to ERROR so a routine
+    # request/response log line can't surface the token. (Behavior-neutral:
+    # only suppresses log output, no control-flow change.)
+    for token_bearing in ("httpx", "telegram", "telegram.ext", "telegram.bot"):
+        logging.getLogger(token_bearing).setLevel(logging.ERROR)

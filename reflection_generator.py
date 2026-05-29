@@ -274,6 +274,11 @@ class ReflectionGenerator:
             log.exception("[REFLECTION] Gemini call failed")
             return None, None
 
+        # Real token accounting (Fix 2) — reflection calls count toward the
+        # monthly tally and per-model breakdown like any other Gemini call.
+        if response is not None and hasattr(scorer, "_account_usage"):
+            scorer._account_usage(model, response, is_grounded=False)
+
         text = (getattr(response, "text", None) or "").strip()
         if not text:
             log.warning("[REFLECTION] Gemini returned empty text")

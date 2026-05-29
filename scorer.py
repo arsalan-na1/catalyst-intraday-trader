@@ -1,17 +1,14 @@
-"""Gemini 2.5 Flash catalyst scorer (two-stage with grounding).
+"""Gemini catalyst scorer (single structured-verdict call).
 
-Google Search grounding is incompatible with response_mime_type="application/json"
-in a single call, so scoring is split:
+Scoring is a single Gemini call: `response_schema=CatalystVerdict` with no
+tools, taking the trigger data, news items, technicals and quant signals and
+returning a pydantic-validated JSON verdict. The call counts toward the
+15 RPM free-tier ceiling.
 
-  Step 1 (grounded research): Gemini with `tools=[google_search]` and no
-    schema — free-form text summarizing what Google Search finds about the
-    ticker's move and candidate catalysts.
-
-  Step 2 (structured verdict): Gemini with `response_schema=CatalystVerdict`
-    and no tools — takes the step-1 research plus the original trigger data
-    and news items, returns a pydantic-validated JSON verdict.
-
-Both calls count toward the 15 RPM free-tier ceiling.
+(Historically this was a two-stage pipeline with a leading Google Search
+grounding call. That grounded research text was never inserted into the
+verdict prompt — it was the priciest call in the pipeline yet had zero effect
+on the verdict — so it was removed. See git history for the old behavior.)
 
 Verdict cache: results are reused for VERDICT_CACHE_MINUTES minutes per ticker
 to avoid re-scoring the same event and to prevent re-entering a position that
@@ -24,11 +21,13 @@ Gemini requests so a burst of triggers doesn't flood the API.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Literal
 
 from alpaca.data.historical.stock import StockHistoricalDataClient
@@ -55,13 +54,101 @@ from technicals import Technicals, get_technicals
 
 log = logging.getLogger("scorer")
 
-# Research uses gemini-2.5-flash: native Google Search grounding,
-# highest-stakes call in the pipeline.
-# Verdict/eval uses gemini-2.5-flash-lite: 5x cheaper output tokens,
-# full response_schema support confirmed, research context already
-# provided so quality risk is minimal.
-_MODEL_RESEARCH = config.GEMINI_MODEL_RESEARCH
+# Verdict/eval uses gemini-2.5-flash-lite: cheap output tokens, full
+# response_schema support. This is the only scoring model — the former grounded
+# research stage (gemini-2.5-flash + Google Search) was removed because its
+# output was never inserted into the verdict prompt.
 _MODEL_VERDICT  = config.GEMINI_MODEL_VERDICT
+
+
+def compute_gemini_cost(
+    model: str,
+    prompt_tokens: int | None,
+    output_tokens: int | None,
+    *,
+    grounded_queries: int = 0,
+) -> float:
+    """Real USD cost for one Gemini call from token counts.
+
+    Token cost uses config.GEMINI_TOKEN_PRICING ($/1M tokens). An unknown model
+    contributes 0 token cost (the caller logs a warning). Grounding is billed
+    only when config.GEMINI_GROUNDING_COST_PER_1K is non-zero (default 0 — the
+    free quota; the grounded call was removed so grounded_queries is normally 0).
+    Pure function — no I/O, safe to unit-test in isolation.
+    """
+    rates = config.GEMINI_TOKEN_PRICING.get(model)
+    token_cost = 0.0
+    if rates:
+        token_cost = (
+            (prompt_tokens or 0) / 1_000_000.0 * rates["input"]
+            + (output_tokens or 0) / 1_000_000.0 * rates["output"]
+        )
+    grounding_cost = (grounded_queries or 0) / 1000.0 * config.GEMINI_GROUNDING_COST_PER_1K
+    return token_cost + grounding_cost
+
+
+def persist_cost_state(scorer: "Scorer", path) -> None:
+    """Atomically write the running Gemini cost tally to `path` (Fix 4).
+
+    A tiny sidecar, flushed on a short timer, so a mid-day restart resumes from
+    the true accumulated monthly cost instead of the last daily-summary
+    snapshot. Atomic (tmp→rename). Never raises — persistence must not break
+    the bot.
+    """
+    try:
+        path = Path(path)
+        state = {
+            "month": datetime.now(tz=config.MARKET_TZ).strftime("%Y-%m"),
+            "monthly_cost_estimate": round(scorer.monthly_cost_estimate, 6),
+            "usage_day": scorer.usage_day,
+            "usage_by_model": scorer.usage_by_model,
+        }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(state), encoding="utf-8")
+        tmp.replace(path)  # atomic rename — no partial read on crash
+    except Exception:
+        log.warning("failed to persist Gemini cost state", exc_info=True)
+
+
+def restore_cost_state(scorer: "Scorer", path) -> None:
+    """Restore the running cost tally from `path` when it is for the current
+    calendar month (Fix 4). Recomputes _budget_mode so a restored high tally
+    re-enters ungrounded_only / halted. Stale-month or missing file → no-op.
+    Never raises.
+    """
+    try:
+        path = Path(path)
+        if not path.exists():
+            return
+        data = json.loads(path.read_text(encoding="utf-8"))
+        current_month = datetime.now(tz=config.MARKET_TZ).strftime("%Y-%m")
+        if data.get("month") != current_month:
+            log.info(
+                "Gemini cost state is for %s, not %s; ignoring",
+                data.get("month"), current_month,
+            )
+            return
+        cost = data.get("monthly_cost_estimate")
+        if isinstance(cost, (int, float)):
+            scorer.monthly_cost_estimate = float(cost)
+        ubm = data.get("usage_by_model")
+        if isinstance(ubm, dict):
+            scorer.usage_by_model = ubm
+        ud = data.get("usage_day")
+        if isinstance(ud, str):
+            scorer.usage_day = ud
+        cap = config.MONTHLY_GEMINI_BUDGET_USD
+        if scorer.monthly_cost_estimate >= cap:
+            scorer._budget_mode = "halted"
+        elif scorer.monthly_cost_estimate >= cap * 0.8:
+            scorer._budget_mode = "ungrounded_only"
+        log.info(
+            "restored Gemini cost state: $%.4f for %s (mode=%s)",
+            scorer.monthly_cost_estimate, current_month, scorer._budget_mode,
+        )
+    except Exception:
+        log.warning("failed to restore Gemini cost state", exc_info=True)
 
 
 class CatalystVerdict(BaseModel):
@@ -230,28 +317,6 @@ class TriggerContext:
     window_vwap: float | None = None
 
 
-_RESEARCH_SYSTEM_INSTRUCTION = """You are a research analyst investigating a sudden
-price/volume spike in a US equity. Use Google Search to find the most likely cause.
-
-Search specifically for:
-- FDA decisions, PDUFA dates, clinical trial readouts, complete response letters
-- Earnings releases, revenue/EPS beats or misses, guidance changes
-- M&A: mergers, acquisitions, buyouts, asset sales, strategic reviews
-- Analyst upgrades/downgrades with large price target changes (>25% move in PT)
-- SEC filings: 13D/13G activist disclosures, Form 4 insider buying clusters
-- Contract wins (government, DoD, large enterprise)
-- Short squeeze conditions: high short float + price breaking above resistance
-- Buyback authorizations, special dividends, spin-off announcements
-
-Write a plain-text briefing (under 300 words) covering:
-1. Most likely catalyst — what happened and when (pre-market or intraday?)
-2. Source credibility (SEC filing > press release > analyst note > social media)
-3. Whether the move size is proportionate to the catalyst
-4. Whether the catalyst is still being discovered or already fully priced in
-5. Any red flags: thin corroboration, conflicting headlines, no news found
-
-Do NOT return JSON. Do NOT invent events. If no catalyst is found, say so explicitly."""
-
 _VERDICT_SYSTEM_INSTRUCTION = """You are an intraday catalyst trading analyst. Your job is to evaluate
 whether a stock's current move has the characteristics of a trade worth
 taking RIGHT NOW — not whether the company is a good long-term investment.
@@ -358,7 +423,15 @@ class Scorer:
         self._last_scored: dict[str, float] = {}
         self._hist_client = hist_client
         # Monthly Gemini cost cap. Reset by daily_summary on the 1st of each month.
+        # Post-call this is reconciled to the REAL token cost (see _account_usage);
+        # the flat per-call constant added by _record_call_cost is only a
+        # conservative pre-call reservation that prevents racing past the cap.
         self.monthly_cost_estimate: float = 0.0
+        # Real per-day, per-model usage breakdown (Fix 2). usage_day is the ET
+        # date the breakdown covers; usage_by_model maps model -> {calls,
+        # prompt_tokens, output_tokens, cost_usd}. Persisted to performance.json.
+        self.usage_day: str = ""
+        self.usage_by_model: dict[str, dict] = {}
         self._budget_mode: str = "normal"  # "normal" | "ungrounded_only" | "halted"
         # Set from bot.py after construction; called with the alert message.
         self._alert_callback = None
@@ -482,6 +555,82 @@ class Scorer:
 
         return True
 
+    @staticmethod
+    def _extract_usage(response: Any) -> tuple[int, int]:
+        """(prompt_tokens, output_tokens) from a Gemini response.
+
+        Returns (0, 0) when usage_metadata is absent or its fields are None —
+        accounting must never raise on a malformed/partial response.
+        """
+        um = getattr(response, "usage_metadata", None)
+        if um is None:
+            return 0, 0
+        return (
+            int(getattr(um, "prompt_token_count", 0) or 0),
+            int(getattr(um, "candidates_token_count", 0) or 0),
+        )
+
+    def _roll_usage_day(self) -> None:
+        """Reset the per-model breakdown when the ET calendar day changes."""
+        today = datetime.now(tz=config.MARKET_TZ).strftime("%Y-%m-%d")
+        if self.usage_day != today:
+            self.usage_day = today
+            self.usage_by_model = {}
+
+    def _account_usage(
+        self,
+        model: str,
+        response: Any,
+        *,
+        is_grounded: bool = False,
+        grounded_queries: int = 0,
+    ) -> float:
+        """Post-call real-cost accounting (Fix 2).
+
+        Reconciles the flat pre-charge added by _record_call_cost to the REAL
+        token cost from usage_metadata, and records a per-day, per-model
+        token + dollar breakdown. Returns the real cost. Never raises — cost
+        bookkeeping must not break the scoring/trade path.
+        """
+        try:
+            prompt_tok, out_tok = self._extract_usage(response)
+            real = compute_gemini_cost(
+                model, prompt_tok, out_tok, grounded_queries=grounded_queries
+            )
+            reserved = (
+                config.GEMINI_COST_PER_GROUNDED_CALL
+                if is_grounded
+                else config.GEMINI_COST_PER_UNGROUNDED_CALL
+            )
+            # Replace the conservative flat reservation with the real cost so the
+            # monthly tally reflects actual token spend.
+            self.monthly_cost_estimate = max(
+                0.0, self.monthly_cost_estimate - reserved + real
+            )
+            self._roll_usage_day()
+            bucket = self.usage_by_model.setdefault(
+                model,
+                {"calls": 0, "prompt_tokens": 0, "output_tokens": 0, "cost_usd": 0.0},
+            )
+            bucket["calls"] += 1
+            bucket["prompt_tokens"] += prompt_tok
+            bucket["output_tokens"] += out_tok
+            bucket["cost_usd"] = round(bucket["cost_usd"] + real, 6)
+            if model not in config.GEMINI_TOKEN_PRICING:
+                log.warning(
+                    "[COST] unknown model %r — token cost not computed; add it "
+                    "to config.GEMINI_TOKEN_PRICING", model,
+                )
+            return real
+        except Exception:
+            log.debug("[COST] usage accounting failed", exc_info=True)
+            return 0.0
+
+    # TODO(ruflo-cost-tracker): ruflo-cost-tracker is a documentation/plugin
+    # reference (CLAUDE.md), not a runtime dependency — it exposes no in-process
+    # ingestion API importable from this codebase. If/when one ships, forward
+    # (model, prompt_tok, out_tok, real_cost) from _account_usage to it here.
+
     def _cache_get(self, ticker: str) -> CatalystVerdict | None:
         entry = self._cache.get(ticker)
         if entry is None:
@@ -538,110 +687,6 @@ class Scorer:
         )
 
     @staticmethod
-    def _fundamentals_block(f: dict, current_price: float) -> str:
-        if not f:
-            return "Fundamentals: unavailable."
-
-        parts: list[str] = []
-        mcap = f.get("market_cap")
-        if mcap:
-            mcap_str = (
-                f"${mcap / 1e12:.1f}T" if mcap >= 1e12
-                else f"${mcap / 1e9:.1f}B" if mcap >= 1e9
-                else f"${mcap / 1e6:.0f}M"
-            )
-            parts.append(f"Market cap: {mcap_str}")
-        float_sh = f.get("float_shares")
-        if float_sh:
-            float_str = (
-                f"{float_sh / 1e9:.1f}B shares" if float_sh >= 1e9
-                else f"{float_sh / 1e6:.0f}M shares"
-            )
-            parts.append(f"Float: {float_str}")
-        if f.get("sector"):
-            parts.append(f"Sector: {f['sector']}")
-        pe = f.get("pe_ratio")
-        if pe:
-            parts.append(f"P/E: {pe:.1f}")
-
-        lines: list[str] = ["FUNDAMENTALS (yfinance):"]
-        if parts:
-            lines.append(" | ".join(parts))
-
-        high_52 = f.get("52_week_high")
-        low_52 = f.get("52_week_low")
-        if high_52 and low_52:
-            range_line = f"52w range: ${low_52:.2f} – ${high_52:.2f}"
-            if current_price > 0 and high_52 > 0:
-                pct_from_high = (current_price - high_52) / high_52
-                range_line += f" (current is {pct_from_high:+.0%} from 52w high)"
-            lines.append(range_line)
-
-        target = f.get("analyst_target_price")
-        if target and current_price > 0:
-            upside = (target - current_price) / current_price
-            lines.append(f"Analyst mean target: ${target:.2f} ({upside:+.0%} vs current)")
-
-        if f.get("earnings_date"):
-            lines.append(f"Next earnings: {f['earnings_date']}")
-
-        return "\n".join(lines)
-
-    @staticmethod
-    def _alt_data_block(
-        insider: dict,
-        earnings_cal: dict,
-        congress: dict,
-        earnings_surp: dict,
-    ) -> str:
-        lines: list[str] = ["ALTERNATIVE DATA:"]
-
-        if insider:
-            mspr = insider.get("mspr", 0.0)
-            net  = insider.get("net_change", 0)
-            label = "heavy buying" if mspr > 50 else "heavy selling" if mspr < -50 else "neutral"
-            lines.append(
-                f"- Insider sentiment MSPR: {mspr:+.1f} ({label}); "
-                f"net share change: {net:+,}"
-            )
-        else:
-            lines.append("- Insider sentiment: unavailable")
-
-        if earnings_cal:
-            next_date = earnings_cal.get("next_earnings_date", "unknown")
-            imminent  = earnings_cal.get("earnings_imminent", False)
-            days      = earnings_cal.get("days_until_earnings")
-            imm_str   = f"imminent — {days}d away" if imminent else "not imminent"
-            beat_str  = ""
-            if earnings_surp:
-                beat_str = f" | Beat rate: {earnings_surp.get('beat_rate', '?')} last quarters"
-            lines.append(
-                f"- Earnings: {imm_str} — next: {next_date}{beat_str}"
-            )
-        else:
-            beat_str = f" | Beat rate: {earnings_surp['beat_rate']} last quarters" if earnings_surp else ""
-            lines.append(f"- Earnings: date unavailable{beat_str}")
-
-        if congress:
-            count  = congress.get("count", 0)
-            trades = congress.get("trades") or []
-            if count == 0:
-                lines.append("- Congressional trades (90d): none")
-            else:
-                summaries = [
-                    f"{t['name']}: {t['transaction_type']} {t['amount']} ({t['date']})"
-                    for t in trades[:3]
-                ]
-                lines.append(
-                    f"- Congressional trades (90d): {count} trade(s) — "
-                    + "; ".join(summaries)
-                )
-        else:
-            lines.append("- Congressional trades (90d): unavailable")
-
-        return "\n".join(lines)
-
-    @staticmethod
     def _quant_signals_block(
         short_int: dict | None,
         est_rev: dict | None,
@@ -680,62 +725,8 @@ class Scorer:
             return ""
         return "📊 QUANTITATIVE SIGNALS:\n" + "\n".join(lines)
 
-    @staticmethod
-    def _atr_hint(tech: Technicals | None) -> str:
-        if tech is None or tech.atr_14_pct is None:
-            return ""
-        atr = tech.atr_14_pct  # already in % units (8.0 = 8% daily range)
-        if atr > 8.0:
-            return (
-                f"\n⚠️ HIGH VOLATILITY: ATR={atr:.1f}% daily range. "
-                "Consider smaller position size and wider stop loss."
-            )
-        if atr < 2.0:
-            return (
-                f"\nℹ️ LOW VOLATILITY: ATR={atr:.1f}% daily range. "
-                "Tighter stops are appropriate."
-            )
-        return ""
-
-    @staticmethod
-    def _reddit_block(reddit: dict) -> str:
-        if not reddit:
-            return "SOCIAL SENTIMENT (Reddit): unavailable"
-        mentions = reddit.get("mention_count", 0)
-        if mentions == 0:
-            return "SOCIAL SENTIMENT (Reddit, last 24h): 0 mentions across WSB/stocks/investing"
-        score = reddit.get("sentiment_score", 0.0)
-        label = "bullish" if score > 0.2 else "bearish" if score < -0.2 else "neutral"
-        top_title   = reddit.get("top_post_title") or ""
-        top_upvotes = reddit.get("top_post_upvotes", 0)
-        lines = [
-            "SOCIAL SENTIMENT (Reddit, last 24h):",
-            f"- Mentions: {mentions} across WSB/stocks/investing",
-            f"- Sentiment: {score:+.2f} ({label})",
-        ]
-        if top_title:
-            truncated = top_title[:100] + "…" if len(top_title) > 100 else top_title
-            lines.append(f'- Top post: "{truncated}" ({top_upvotes:,} upvotes)')
-        return "\n".join(lines)
-
-    def _build_research_prompt(self, ctx: TriggerContext, news: list[NewsItem]) -> str:
-        now_et = datetime.now(tz=config.MARKET_TZ).strftime("%H:%M ET")
-        if ctx.trigger_type == "gap_open":
-            move_line = f"GAPPED OPEN +{ctx.price_move_pct:.1%} vs previous session close"
-        else:
-            direction = "UP" if ctx.price_move_pct >= 0 else "DOWN"
-            move_line = f"{direction} {abs(ctx.price_move_pct):.1%} in last 2 min"
-        return (
-            f"Ticker: {ctx.ticker}\n"
-            f"Current price: ${ctx.price:.2f}  ({move_line})\n"
-            f"Current time: {now_et}\n"
-            f"Volume vs expected pace: {ctx.volume_ratio:.1f}× average\n\n"
-            f"News already fetched (real-time, may be incomplete):\n{self._news_block(news)}\n\n"
-            "Search Google for the most likely catalyst. Write a concise briefing."
-        )
-
     def _build_verdict_prompt(
-        self, ctx: TriggerContext, news: list[NewsItem], research: str,
+        self, ctx: TriggerContext, news: list[NewsItem],
         tech: Technicals | None = None,
         fundamentals: dict | None = None,
         insider: dict | None = None,
@@ -830,52 +821,8 @@ class Scorer:
             )
         return prompt
 
-    async def _research_with_grounding(
-        self, ctx: TriggerContext, news: list[NewsItem]
-    ) -> str | None:
-        if not self._check_hourly_limit():
-            self.calls_skipped += 1
-            return None
-        # Build prompt BEFORE charging budget/slots: if our own code raises
-        # during prompt construction, we haven't actually called Gemini and
-        # must not consume any of the 60/hr cap, monthly budget, or RPM slot.
-        try:
-            prompt = self._build_research_prompt(ctx, news)
-        except Exception:
-            log.exception(
-                "research prompt build failed for %s; budget not charged",
-                ctx.ticker,
-            )
-            return None
-        # Monthly budget gate — must pass before incurring grounded-call cost.
-        if not self._record_call_cost(is_grounded=True):
-            self.calls_skipped += 1
-            return None
-        await self._limiter.acquire()
-        self._consume_hourly_slot()
-        self.calls_today += 1
-        try:
-            response = await self._client.aio.models.generate_content(
-                model=_MODEL_RESEARCH,
-                contents=prompt,
-                config=genai_types.GenerateContentConfig(
-                    system_instruction=_RESEARCH_SYSTEM_INSTRUCTION,
-                    tools=[genai_types.Tool(google_search=genai_types.GoogleSearch())],
-                    temperature=0.2,
-                ),
-            )
-        except Exception:
-            log.exception("gemini research call failed for %s", ctx.ticker)
-            return None
-
-        text = (getattr(response, "text", None) or "").strip()
-        if not text:
-            log.warning("gemini research returned empty text for %s", ctx.ticker)
-            return None
-        return text
-
     async def _verdict_from_research(
-        self, ctx: TriggerContext, news: list[NewsItem], research: str,
+        self, ctx: TriggerContext, news: list[NewsItem],
         tech: Technicals | None = None,
         fundamentals: dict | None = None,
         insider: dict | None = None,
@@ -894,7 +841,7 @@ class Scorer:
         # must not consume any of the 60/hr cap, monthly budget, or RPM slot.
         try:
             prompt = self._build_verdict_prompt(
-                ctx, news, research, tech, fundamentals,
+                ctx, news, tech, fundamentals,
                 insider, earnings_cal, congress, earnings_surp, reddit,
                 quant_signals=quant_signals,
                 sector_name=sector_name,
@@ -940,6 +887,11 @@ class Scorer:
                 log.exception("gemini verdict call failed for %s after retry", ctx.ticker)
                 return None
 
+        # Real token accounting (Fix 2). Account as soon as we have a response —
+        # tokens are billed even if the verdict text is empty or fails validation.
+        if response is not None:
+            self._account_usage(_MODEL_VERDICT, response, is_grounded=False)
+
         text = getattr(response, "text", None) or ""
         if not text:
             log.warning("gemini verdict returned empty text for %s", ctx.ticker)
@@ -973,35 +925,88 @@ class Scorer:
         quant_signals: dict | None = None,
         sector_name: str = "",
     ) -> CatalystVerdict | None:
-        """Single Gemini verdict call with no Google Search grounding.
+        """Single Gemini verdict call (the only scoring call there is).
 
-        Roughly 10× cheaper than the full two-call grounded path.  Used for:
+        Used for:
           • Weak triggers (vol_ratio < GROUNDING_VOL_THRESHOLD AND move < GROUNDING_PRICE_THRESHOLD)
-          • Microcap screener Stage-2 quick check before committing to full grounding.
+          • Microcap screener Stage-2 quick check.
         Accepts optional pre-fetched data; any missing field defaults to None (neutral).
         Increments calls_ungrounded so the daily summary can report the breakdown.
         """
         self.calls_ungrounded += 1
-        research = (
-            "[No web search grounding — verdict based on available news only]\n\n"
-            f"Available news for {ctx.ticker}:\n{self._news_block(news)}"
-        )
         return await self._verdict_from_research(
-            ctx, news, research, tech, fundamentals,
+            ctx, news, tech, fundamentals,
             insider, earnings_cal, congress, earnings_surp, reddit,
             quant_signals=quant_signals,
             sector_name=sector_name,
         )
 
+    async def fetch_technicals(self, ctx: TriggerContext) -> Technicals | None:
+        """Fetch technicals for the deterministic pre-Gemini reject gates (Fix 3).
+
+        Mirrors the fetch score() does internally so the caller can gate on RSI /
+        trend / 52w-distance BEFORE spending a Gemini call, then hand the result
+        back to score(tech=...) to avoid a second fetch. Fail-soft: returns None
+        on any error (the gates fail-open/closed on None exactly as before).
+        """
+        if self._hist_client is None:
+            return None
+        try:
+            return await get_technicals(ctx.ticker, self._hist_client, ctx.price)
+        except Exception:
+            log.debug("technicals prefetch failed for %s", ctx.ticker, exc_info=True)
+            return None
+
+    def will_score_call_model(self, ctx: TriggerContext) -> bool:
+        """True iff score(ctx) would actually invoke Gemini right now (Fix 3).
+
+        Non-mutating mirror of score()'s early-return guards — verdict cache,
+        the per-ticker 30-min scoring cooldown, and a halted budget. The caller
+        uses this to decide whether the pre-Gemini reject gate may short-circuit:
+        it only does so when a real (billable) call is imminent, so cache- /
+        cooldown-served candidates keep flowing through score() and the
+        authoritative post-score gates exactly as before. Keep in lockstep with
+        the guards at the top of score().
+        """
+        if self._budget_mode == "halted":
+            return False
+        entry = self._cache.get(ctx.ticker)
+        if entry is not None:
+            cached_at, _ = entry
+            age_min = (datetime.now(timezone.utc) - cached_at).total_seconds() / 60.0
+            if age_min < config.VERDICT_CACHE_MINUTES:
+                return False
+        last = self._last_scored.get(ctx.ticker)
+        if last is not None and time.monotonic() - last < 1800:
+            return False
+        return True
+
+    def note_scored(self, ticker: str) -> None:
+        """Start the 30-min per-ticker scoring cooldown without calling Gemini.
+
+        Used when a pre-Gemini reject gate (bot._process_trigger, Fix 3) skips
+        the scoring call: the old flow ran score() — which set this cooldown on
+        success — before the gate rejected, so re-triggers were suppressed for
+        30 min. Marking it here preserves that suppression, keeping the
+        accept/reject set identical to the pre-reorder behavior.
+        """
+        self._last_scored[ticker] = time.monotonic()
+
     async def score(
-        self, ctx: TriggerContext, news: list[NewsItem]
+        self, ctx: TriggerContext, news: list[NewsItem],
+        *, tech: Technicals | None = None,
     ) -> tuple[CatalystVerdict | None, Technicals | None, dict]:
         """Score a trigger event. Returns (verdict, technicals, quant_signals).
 
         quant_signals is a dict with keys: short_interest, estimate_revisions,
         insider_score, sector_momentum — each value is a dict or None.
         Returns an empty dict on cache/cooldown hits.
+
+        When `tech` is supplied (pre-fetched by the caller for the pre-Gemini
+        reject gates — see bot._process_trigger, Fix 3), it is reused as-is and
+        the internal technicals fetch is skipped so we never double-fetch.
         """
+        precomputed_tech = tech
         cached = self._cache_get(ctx.ticker)
         if cached is not None:
             return cached, None, {}
@@ -1022,12 +1027,15 @@ class Scorer:
         # Gemini call must NOT poison the per-ticker 30-min cooldown — the next
         # trigger for this ticker should be allowed to retry immediately.
 
-        # Opt 1: skip expensive Google Search grounding for weak signals.
+        # Strong vs weak signal. Historically this gated an extra Google-Search
+        # grounding call; that call was removed, so both buckets now make the
+        # same single verdict call and this only selects the telemetry counter
+        # (calls_grounded vs calls_ungrounded).
         use_grounding = not (
             ctx.volume_ratio < config.GROUNDING_VOL_THRESHOLD
             and abs(ctx.price_move_pct) < config.GROUNDING_PRICE_THRESHOLD
         )
-        # Monthly budget overrides — once 80% used, no more grounded calls.
+        # Monthly budget overrides — once 80% used, force the weak/ungrounded bucket.
         if self._budget_mode == "ungrounded_only":
             use_grounding = False
 
@@ -1040,8 +1048,9 @@ class Scorer:
             # treat None / {} as "signal unavailable".
             _enrichment_sources = (
                 ("technicals",
-                 get_technicals(ctx.ticker, self._hist_client, ctx.price)
-                 if self._hist_client else _coro_none()),
+                 _coro_none() if precomputed_tech is not None
+                 else (get_technicals(ctx.ticker, self._hist_client, ctx.price)
+                       if self._hist_client else _coro_none())),
                 ("fundamentals",       get_fundamentals(ctx.ticker)),
                 ("insider_sentiment",  get_insider_sentiment(ctx.ticker)),
                 ("earnings_calendar",  get_earnings_calendar(ctx.ticker)),
@@ -1071,6 +1080,11 @@ class Scorer:
              reddit,
              short_int, est_rev, ins_score) = _safe
 
+            # Reuse caller-supplied technicals (Fix 3) — the gather slot above
+            # was a no-op when precomputed_tech was provided.
+            if precomputed_tech is not None:
+                tech = precomputed_tech
+
             # Sector momentum needs the sector from fundamentals; fetch after gather.
             sector_name = (fundamentals or {}).get("sector", "") or ""
             sector_mom = await get_sector_momentum(sector_name, self._hist_client)
@@ -1092,11 +1106,8 @@ class Scorer:
                 return None, tech, quant_signals
 
             if use_grounding:
-                research = await self._research_with_grounding(ctx, news)
-                if research is None:
-                    return None, tech, quant_signals
                 verdict = await self._verdict_from_research(
-                    ctx, news, research, tech, fundamentals,
+                    ctx, news, tech, fundamentals,
                     insider, earnings_cal, congress, earnings_surp, reddit,
                     quant_signals=quant_signals,
                     sector_name=sector_name,
@@ -1105,12 +1116,12 @@ class Scorer:
             else:
                 if self._budget_mode == "ungrounded_only":
                     log.info(
-                        "[SCORER] %s budget mode=ungrounded_only; skipping grounding",
+                        "[SCORER] %s budget mode=ungrounded_only (weak bucket)",
                         ctx.ticker,
                     )
                 else:
                     log.info(
-                        "[SCORER] %s weak signal (vol=%.1fx, move=%.1f%%); skipping grounding",
+                        "[SCORER] %s weak signal (vol=%.1fx, move=%.1f%%)",
                         ctx.ticker, ctx.volume_ratio, ctx.price_move_pct * 100,
                     )
                 verdict = await self._score_without_grounding(
@@ -1283,6 +1294,10 @@ class Scorer:
             except Exception:
                 log.exception("gemini position eval failed for %s", ctx.ticker)
                 return None
+
+        # Real token accounting (Fix 2).
+        if response is not None:
+            self._account_usage(_MODEL_VERDICT, response, is_grounded=False)
 
         text = getattr(response, "text", None) or ""
         if not text:

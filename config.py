@@ -282,7 +282,10 @@ MICROCAP_DEDUP_HOURS = _int("MICROCAP_DEDUP_HOURS", 6)
 MICROCAP_MIN_DOLLAR_VOLUME = _float("MICROCAP_MIN_DOLLAR_VOLUME", 500_000.0)
 
 # --- Gemini cost controls ---
-# Skip Google Search grounding for signals below these thresholds (uses ~10× cheaper ungrounded call).
+# Below these thresholds a trigger is bucketed as a "weak" signal. NOTE: since
+# the grounded Google-Search research call was removed, both buckets now make
+# the SAME single verdict call — these thresholds only select which counter
+# (calls_grounded vs calls_ungrounded) is incremented for telemetry.
 GROUNDING_VOL_THRESHOLD   = _float("GROUNDING_VOL_THRESHOLD",   3.0)
 GROUNDING_PRICE_THRESHOLD = _float("GROUNDING_PRICE_THRESHOLD", 0.03)
 # Hard cap on total Gemini API calls per hour across all modules.
@@ -304,6 +307,11 @@ DAILY_SUMMARY_HOUR = 16
 DAILY_SUMMARY_MINUTE = 5
 HEARTBEAT_INTERVAL_MINUTES = _int("HEARTBEAT_INTERVAL_MINUTES", 30)
 PERFORMANCE_FILE = PROJECT_ROOT / "performance.json"
+# Incremental Gemini cost-state sidecar (Fix 4): flushed every
+# COST_PERSIST_SECONDS so a mid-day restart resumes the true monthly tally
+# instead of drifting back to the last daily-summary snapshot.
+GEMINI_COST_STATE_FILE = STATE_DIR / "gemini_cost.json"
+COST_PERSIST_SECONDS = _int("COST_PERSIST_SECONDS", 60)
 
 # --- Quantitative signal cache TTLs ---
 SHORT_INTEREST_CACHE_HOURS = _int("SHORT_INTEREST_CACHE_HOURS", 4)
@@ -311,14 +319,10 @@ ESTIMATE_REVISION_CACHE_HOURS = _int("ESTIMATE_REVISION_CACHE_HOURS", 6)
 INSIDER_CACHE_HOURS = _int("INSIDER_CACHE_HOURS", 12)
 
 # --- Gemini model selection ---
-# Research uses gemini-2.5-flash: native Google Search grounding,
-# highest-stakes call in the pipeline.
-# Verdict/eval uses gemini-2.5-flash-lite: 5x cheaper output tokens,
-# full response_schema support confirmed, research context already
-# provided so quality risk is minimal.
-GEMINI_MODEL_RESEARCH = os.getenv(
-    "GEMINI_MODEL_RESEARCH", "gemini-2.5-flash"
-)
+# Single scoring call: gemini-2.5-flash-lite (cheap output tokens, full
+# response_schema support). The former grounded research stage
+# (gemini-2.5-flash + Google Search) was removed — its output was never used
+# in the verdict prompt — so GEMINI_MODEL_RESEARCH no longer exists.
 GEMINI_MODEL_VERDICT = os.getenv(
     "GEMINI_MODEL_VERDICT", "gemini-2.5-flash-lite"
 )
@@ -339,8 +343,27 @@ KRONOS_MIN_PROB = _float("KRONOS_MIN_PROB", 0.45)
 # all Gemini calls halt for the rest of the month — bot keeps running on
 # TP/SL/timeout rules. Reset on the 1st of each calendar month.
 MONTHLY_GEMINI_BUDGET_USD       = _float("MONTHLY_GEMINI_BUDGET_USD", 30.0)
+# Flat per-call estimates. Retained ONLY as a conservative pre-call budget
+# reservation in Scorer._record_call_cost; the real monthly tally is now
+# reconciled to token-based cost (see GEMINI_TOKEN_PRICING below).
 GEMINI_COST_PER_GROUNDED_CALL   = _float("GEMINI_COST_PER_GROUNDED_CALL", 0.016)
 GEMINI_COST_PER_UNGROUNDED_CALL = _float("GEMINI_COST_PER_UNGROUNDED_CALL", 0.002)
+
+# --- Real per-token Gemini pricing (USD per 1,000,000 tokens) ---
+# Source of truth for actual cost, computed from response.usage_metadata.
+# Add a model string here if GEMINI_MODEL_* is pointed at a new model, or the
+# call's token cost silently drops to $0 (a warning is logged).
+GEMINI_TOKEN_PRICING = {
+    "gemini-2.5-flash":      {"input": 0.30, "output": 2.50},
+    "gemini-2.5-flash-lite": {"input": 0.10, "output": 0.40},
+}
+# Google Search grounding billing. Real rate is $35 / 1,000 queries after the
+# first GEMINI_GROUNDING_FREE_PER_DAY queries/day (shared quota). Modeled as
+# $0 (assume under quota) by default — set GEMINI_GROUNDING_COST_PER_1K=35 to
+# bill it. NOTE: the grounded research call was removed (see scorer.py), so
+# grounded_queries is 0 in practice; this is kept for future re-introduction.
+GEMINI_GROUNDING_COST_PER_1K  = _float("GEMINI_GROUNDING_COST_PER_1K", 0.0)
+GEMINI_GROUNDING_FREE_PER_DAY = _int("GEMINI_GROUNDING_FREE_PER_DAY", 1500)
 
 # --- Post-trade reflection loop ---
 # After each trade closes, a one-paragraph reflection is generated via Gemini

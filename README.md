@@ -8,8 +8,8 @@ An autonomous, event-driven intraday trading bot that detects high-momentum cata
 
 The bot monitors ~2,600 tickers via the Alpaca WebSocket bar stream. When a stock moves ≥8% with 5× normal volume — or a biotech/FDA ticker moves ≥5% — it fires a scoring pipeline:
 
-1. **Gemini research call** (grounded web search) — fetches and summarizes the news catalyst
-2. **Gemini verdict call** (structured schema) — produces a `should_trade` decision plus per-trade TP, SL, position size, and hold time
+1. **Deterministic technical gate** — RSI / downtrend / falling-knife checks run first, so doomed candidates never reach Gemini
+2. **Gemini verdict call** (single structured-schema call) — produces a `should_trade` decision plus per-trade TP, SL, position size, and hold time
 3. **Quantitative factor overlay** — short interest squeeze score, analyst estimate revisions, insider sentiment, sector ETF momentum
 4. **Market regime filter** — HMM-detected SPY regime (trending / ranging / volatile) scales position size and hold time
 5. **Order execution** — Alpaca paper market order with Gemini-set parameters, clamped to hard risk limits
@@ -48,8 +48,7 @@ pipeline_consumer (bot.py)
     ├─ fetch_technicals (technicals.py)
     ├─ fetch_fundamentals (fundamentals.py)
     ├─ quant signals: short_interest / estimate_revisions / insider / sector_momentum
-    └─ scorer.score() → 2 Gemini API calls
-           research call: google_search grounding → free-form text
+    └─ scorer.score() → 1 Gemini API call
            verdict call: response_schema=CatalystVerdict → structured JSON
                 ↓
         trader.execute_auto_buy()
@@ -73,7 +72,7 @@ The WebSocket stream runs in a worker thread (`asyncio.to_thread`). All cross-th
 ## Key Features
 
 ### Gemini AI Integration
-Two-stage scoring on every trigger. The first call uses Google Search grounding to pull live news; the second call enforces a Pydantic schema (`CatalystVerdict`) to produce a structured trade decision. Google Search grounding is incompatible with `response_schema` in a single call, hence the split.
+A single scoring call per trigger: it enforces a Pydantic schema (`CatalystVerdict`) to produce a structured trade decision. (An earlier design had a leading Google-Search "research" call, but its output was never used in the verdict prompt, so it was removed.) Cost is metered from real `usage_metadata` token counts, not a flat per-call estimate.
 
 Gemini sets per-trade parameters:
 - `take_profit_pct` — 5–50%, scaled to catalyst strength
@@ -125,11 +124,11 @@ All four fail open — if unavailable, their line is silently omitted from the G
 `stream.py` subscribes to Alpaca minute bars for ~2,600 tickers (main watchlist) and ~787 catalyst tickers (biotech/FDA/high-short). `TriggerDetector` tracks rolling price history per ticker and fires a `TriggerEvent` when both price-move and volume thresholds are met simultaneously. Gap-open triggers fire once at 9:30 ET for any ticker gapping ≥15% vs the prior session close.
 
 ### Gemini Cost Controls
-Monthly budget cap enforced in `scorer.py`:
-- At 80% of `MONTHLY_GEMINI_BUDGET_USD` (default $30): switches to ungrounded calls only (no Google Search)
+Monthly budget cap enforced in `scorer.py`, driven by real token cost:
+- At 80% of `MONTHLY_GEMINI_BUDGET_USD` (default $30): throttles to the weak-signal bucket
 - At 100%: halts all Gemini calls for the rest of the month; bot continues on TP/SL/timeout rules
 
-Cost state persists across restarts in `performance.json` and resets on the 1st of each month.
+The running tally is flushed to `state/gemini_cost.json` every `COST_PERSIST_SECONDS` (and to `performance.json` at the daily summary, with a per-day/per-model token breakdown), so a mid-day restart resumes the true tally. Resets on the 1st of each month.
 
 ---
 
@@ -222,7 +221,7 @@ ssh aso@<PI_IP> "journalctl -u trading-bot -f"
 .
 ├── bot.py                   # Entrypoint — asyncio main loop, task orchestration
 ├── stream.py                # Alpaca WebSocket stream + TriggerDetector
-├── scorer.py                # Two-stage Gemini scoring + budget tracker
+├── scorer.py                # Single-call Gemini scoring + real-token budget tracker
 ├── trader.py                # Order execution, fill handling, EOD close
 ├── position_monitor.py      # Periodic Gemini re-evaluation of open positions
 ├── news.py                  # Multi-source news fetcher + sector classifier
@@ -276,9 +275,8 @@ All thresholds are overridable via `.env`. See `.env.example` for the full list.
 | `VOLUME_RATIO_THRESHOLD` | 5× | Volume vs ADV required to trigger |
 | `MAX_POSITIONS` | 5 | Maximum concurrent positions |
 | `DAILY_LOSS_LIMIT_PCT` | 2% | Circuit breaker threshold |
-| `MONTHLY_GEMINI_BUDGET_USD` | $30 | Monthly Gemini hard cost cap |
-| `GEMINI_MODEL_RESEARCH` | `gemini-2.5-flash` | Grounded research call |
-| `GEMINI_MODEL_VERDICT` | `gemini-2.5-flash-lite` | Structured verdict call |
+| `MONTHLY_GEMINI_BUDGET_USD` | $30 | Monthly Gemini hard cost cap (real-token based) |
+| `GEMINI_MODEL_VERDICT` | `gemini-2.5-flash-lite` | The single structured verdict call (only scoring model) |
 
 ---
 

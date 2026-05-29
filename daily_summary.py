@@ -225,6 +225,7 @@ def _append_performance(
     today: datetime,
     monthly_cost_estimate: float | None = None,
     monthly_key: str | None = None,
+    gemini_usage: dict | None = None,
 ) -> None:
     path = config.PERFORMANCE_FILE
     data: dict = {}
@@ -236,7 +237,7 @@ def _append_performance(
 
     date_key = today.astimezone(config.MARKET_TZ).strftime("%Y-%m-%d")
     wins = sum(1 for r in stats.trade_records if r.pnl_dollars > 0)
-    data[date_key] = {
+    entry = {
         "pnl": round(stats.realized_pnl, 2),
         "trades": stats.trades_taken,
         "wins": wins,
@@ -244,6 +245,10 @@ def _append_performance(
         "gemini_calls": gemini_calls,
         "balance": round(balance, 2) if balance else None,
     }
+    # Per-day, per-model real token + dollar breakdown (Fix 2).
+    if gemini_usage:
+        entry["gemini_usage"] = gemini_usage
+    data[date_key] = entry
     # Top-level monthly cost tracking (not nested under a date entry).
     if monthly_cost_estimate is not None:
         data["monthly_cost_estimate"] = round(monthly_cost_estimate, 4)
@@ -348,6 +353,7 @@ async def run_daily_summary(
             await asyncio.to_thread(
                 _append_performance, stats, gemini_calls, balance, now_utc,
                 monthly_cost, current_month,
+                getattr(scorer, "usage_by_model", None),
             )
         except Exception:
             log.exception("failed to append performance record")

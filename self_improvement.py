@@ -262,6 +262,10 @@ async def _call_gemini(
         log.exception("[self_improvement] Gemini call failed")
         return None
 
+    # Real token accounting (Fix 2). Standalone mode (scorer=None) has no tally.
+    if scorer is not None and response is not None and hasattr(scorer, "_account_usage"):
+        scorer._account_usage(config.GEMINI_MODEL_VERDICT, response, is_grounded=False)
+
     text = (getattr(response, "text", None) or "").strip()
     if not text:
         log.warning("[self_improvement] Gemini returned empty text")

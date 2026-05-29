@@ -32,8 +32,8 @@ Filter rationale (each threshold tunable via .env):
         Stops the same hot ticker spamming the chat across multiple polls
         within the same session.
 
-Survivors pass through the existing Scorer (Gemini grounded research +
-verdict) — the alert fires regardless of whether a news catalyst was
+Survivors pass through the existing Scorer (single Gemini verdict
+call) — the alert fires regardless of whether a news catalyst was
 identified, but the alert message reflects which case applied so a
 volume-only signal can be sized accordingly by the trader.
 
@@ -338,13 +338,14 @@ class MicrocapScreener:
             log.exception("%s news fetch failed for %s", _LOG_PREFIX, symbol)
             news_items = []
 
-        # --- Opt 3 Stage 2: no-grounding quick check ---
-        # Call Gemini once without Google Search to filter obvious no-trades cheaply.
-        # Only proceed to full grounding if should_trade=True AND confidence >= 7.
+        # --- Opt 3 Stage 2: cheap news-only quick check ---
+        # One Gemini verdict call on news alone (no enrichment fetches) to filter
+        # obvious no-trades cheaply. Only proceed to full scoring (enrichment +
+        # verdict) if should_trade=True AND confidence >= 7.
         try:
             quick_verdict = await self._scorer._score_without_grounding(ctx, news_items)
         except Exception:
-            log.exception("%s quick (no-grounding) score failed for %s; proceeding to full score",
+            log.exception("%s quick (news-only) score failed for %s; proceeding to full score",
                           _LOG_PREFIX, symbol)
             quick_verdict = None
 
@@ -358,18 +359,18 @@ class MicrocapScreener:
             )
             return
 
-        use_full_grounding = quick_verdict is None or quick_verdict.confidence >= 7
-        if use_full_grounding:
+        use_full_scoring = quick_verdict is None or quick_verdict.confidence >= 7
+        if use_full_scoring:
             log.info(
-                "%s %s Stage-2 passed (conf=%s); proceeding to full grounding",
+                "%s %s Stage-2 passed (conf=%s); proceeding to full scoring",
                 _LOG_PREFIX, symbol,
                 quick_verdict.confidence if quick_verdict else "N/A (quick score failed)",
             )
             verdict, tech, _ = await self._scorer.score(ctx, news_items)
         else:
-            # should_trade=True but confidence < 7: enter on no-grounding verdict.
+            # should_trade=True but confidence < 7: enter on the news-only verdict.
             log.info(
-                "%s %s entering on no-grounding verdict (conf=%d < 7)",
+                "%s %s entering on news-only verdict (conf=%d < 7)",
                 _LOG_PREFIX, symbol, quick_verdict.confidence,
             )
             verdict, tech = quick_verdict, None
