@@ -18,6 +18,7 @@ async def fetch_with_retry(
     *,
     retries: int = 3,
     backoff: float = 1.5,
+    max_bytes: int | None = None,
     **kwargs: Any,
 ) -> tuple[int, str] | None:
     """GET url with exponential-backoff retry on transient errors.
@@ -29,6 +30,11 @@ async def fetch_with_retry(
     Retries on: HTTP 429/500/502/503/504 or aiohttp.ClientError.
     On 429: honours Retry-After header when parseable as float seconds.
     Backoff: waits backoff**attempt seconds before each retry.
+
+    max_bytes: when set, a response whose Content-Length exceeds it (or whose
+    body exceeds it when the length is undeclared/chunked) is dropped — the call
+    returns (status, "") so size-unbounded external sources can't OOM the
+    process. Defaults to None (unbounded, unchanged behavior).
     """
     for attempt in range(retries + 1):
         try:
@@ -49,6 +55,22 @@ async def fetch_with_retry(
                     )
                     await asyncio.sleep(wait)
                     continue
+                if max_bytes is not None:
+                    declared = resp.content_length
+                    if declared is not None and declared > max_bytes:
+                        log.warning(
+                            "%s response is %d bytes (> max_bytes %d); dropping",
+                            url, declared, max_bytes,
+                        )
+                        return status, ""
+                    body = await resp.content.read(max_bytes + 1)
+                    if len(body) > max_bytes:
+                        log.warning(
+                            "%s response body exceeded max_bytes %d; dropping",
+                            url, max_bytes,
+                        )
+                        return status, ""
+                    return status, body.decode("utf-8", errors="replace")
                 return status, await resp.text()
         except aiohttp.ClientError as exc:
             if attempt < retries:

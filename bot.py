@@ -37,6 +37,8 @@ from premarket_scanner import run_premarket_scanner
 from position_monitor import run_position_monitor
 from news import determine_sector, fetch_news, is_analyst_action, is_biotech_catalyst, is_insider_buying
 from kronos_scorer import get_continuation_prob
+import congress_trades
+from congress_portfolio import CongressPortfolio
 from reflection_generator import ReflectionGenerator
 from reflection_store import ReflectionStore
 from scorer import Scorer, TriggerContext, persist_cost_state, restore_cost_state
@@ -593,6 +595,104 @@ async def run_cost_persister(scorer: Scorer, stop_event: asyncio.Event) -> None:
             last_persisted = current
 
 
+async def _congress_fetch_prices(
+    http_session: aiohttp.ClientSession, tickers
+) -> dict[str, float]:
+    """Latest prices for `tickers` via the Alpaca IEX snapshots REST endpoint
+    (same shape as Trader._fetch_snapshot_price). Fail-open per ticker: a missing
+    price is simply omitted. Read-only market data — no Alpaca SDK, no orders."""
+    prices: dict[str, float] = {}
+    symbols = [t for t in tickers if t]
+    if not symbols:
+        return prices
+    url = "https://data.alpaca.markets/v2/stocks/snapshots"
+    headers = {
+        "APCA-API-KEY-ID": config.ALPACA_API_KEY,
+        "APCA-API-SECRET-KEY": config.ALPACA_SECRET_KEY,
+    }
+    for i in range(0, len(symbols), 100):
+        chunk = symbols[i:i + 100]
+        try:
+            async with http_session.get(
+                url,
+                params={"symbols": ",".join(chunk), "feed": "iex"},
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status != 200:
+                    log.warning("[CONGRESS] snapshot HTTP %s", resp.status)
+                    continue
+                data = await resp.json()
+        except Exception:
+            log.warning("[CONGRESS] snapshot fetch failed", exc_info=True)
+            continue
+        for sym in chunk:
+            snap = data.get(sym) or {}
+            raw = (snap.get("latestTrade") or {}).get("p") or (snap.get("dailyBar") or {}).get("c")
+            if raw:
+                try:
+                    prices[sym] = float(raw)
+                except (TypeError, ValueError):
+                    pass
+    return prices
+
+
+async def _run_congress_cycle(
+    portfolio: CongressPortfolio, http_session: aiohttp.ClientSession, today: str | None = None
+) -> None:
+    """One daily cycle: refresh disclosures, price the relevant tickers, apply
+    them to the virtual portfolio, persist, and log a P&L summary. Fail-open."""
+    today = today or datetime.now(tz=config.MARKET_TZ).date().isoformat()
+    await congress_trades.refresh(http_session, config.CONGRESS_TRADES_FILE)
+    trades = congress_trades.load_trades(config.CONGRESS_TRADES_FILE)
+    if not trades:
+        log.info("[CONGRESS] no trades available this cycle")
+        return
+    buys = congress_trades.buys_only(trades)
+    candidates = [t for t in buys if portfolio.should_open(t, today, config.CONGRESS_FRESHNESS_DAYS)]
+    needed = {t.ticker for t in candidates} | {p.ticker for p in portfolio.open.values()}
+    prices = await _congress_fetch_prices(http_session, needed)
+    opened, closed = portfolio.apply_disclosures(trades, prices, today)
+    portfolio.save(config.CONGRESS_PORTFOLIO_FILE)
+    summary = portfolio.mark_to_market(prices)
+    log.info(
+        "[CONGRESS] cycle: +%d opened, -%d closed | equity $%.2f (%+.2f%%) | "
+        "%d open, realized $%.2f",
+        len(opened), len(closed), summary["equity"],
+        summary["total_return_pct"] * 100, summary["open_positions"],
+        summary["realized_pnl"],
+    )
+
+
+async def run_congress_copy(
+    http_session: aiohttp.ClientSession, stop_event: asyncio.Event
+) -> None:
+    """Daily virtual congress-copy portfolio updater (OFF by default).
+
+    Gated by config.CONGRESS_COPY_ENABLED and additionally self-guards here, so
+    even if scheduled it is inert when disabled. Never places Alpaca orders and
+    never touches scalper state — it only marks a virtual portfolio to market on
+    a daily cadence (never the intraday hot path). Fails open: a bad cycle is
+    logged and the loop continues.
+    """
+    if not config.CONGRESS_COPY_ENABLED:
+        log.info("[CONGRESS] copy portfolio disabled; coroutine exiting (no-op)")
+        return
+    portfolio = CongressPortfolio.load(config.CONGRESS_PORTFOLIO_FILE)
+    interval = config.CONGRESS_REFRESH_HOURS * 3600
+    log.info("[CONGRESS] copy portfolio ENABLED — virtual only, daily cadence")
+    while not stop_event.is_set():
+        try:
+            await _run_congress_cycle(portfolio, http_session)
+        except Exception:
+            log.warning("[CONGRESS] cycle failed (fail-open)", exc_info=True)
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval)
+            return
+        except asyncio.TimeoutError:
+            continue
+
+
 async def run_nightly_self_improvement(scorer: Scorer, stop_event: asyncio.Event) -> None:
     """Run self-improvement once per day at 4:30 PM ET, after EOD close completes.
 
@@ -1082,6 +1182,10 @@ async def main() -> int:
             ))
         else:
             log.info("[MICROCAP] disabled via config; not scheduling task")
+        if config.CONGRESS_COPY_ENABLED:
+            tasks.append(run_congress_copy(http_session, stop_event))
+        else:
+            log.info("[CONGRESS] copy portfolio disabled via config; not scheduling task")
         tasks.append(_supervise(
             "run_premarket_scanner",
             lambda: run_premarket_scanner(

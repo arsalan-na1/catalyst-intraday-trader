@@ -298,8 +298,11 @@ def load_trades(path=None) -> list[CongressTrade]:
 # --- fetch (fail-open) -----------------------------------------------------
 
 
-async def _fetch_json(session: aiohttp.ClientSession, url: str, label: str):
-    res = await fetch_with_retry(session, url)
+async def _fetch_json(session: aiohttp.ClientSession, url: str, label: str, **kwargs):
+    # NOTE: any secret (e.g. the FMP apikey) must be passed via the `params`
+    # kwarg, NOT formatted into `url` — fetch_with_retry logs `url` on retryable
+    # errors, so a key in the URL string would leak into the logs.
+    res = await fetch_with_retry(session, url, **kwargs)
     if res is None:
         log.warning("[CONGRESS] %s fetch exhausted retries", label)
         return None
@@ -315,7 +318,10 @@ async def _fetch_json(session: aiohttp.ClientSession, url: str, label: str):
 
 
 async def _fetch_senate_stock_watcher(session) -> list[CongressTrade]:
-    data = await _fetch_json(session, config.CONGRESS_SENATE_FALLBACK_URL, "Senate Stock Watcher")
+    data = await _fetch_json(
+        session, config.CONGRESS_SENATE_FALLBACK_URL, "Senate Stock Watcher",
+        max_bytes=config.CONGRESS_MAX_FETCH_BYTES,
+    )
     if not isinstance(data, list):
         return []
     return parse_senate_stock_watcher(data)
@@ -327,8 +333,12 @@ async def _fetch_fmp(session) -> list[CongressTrade]:
     limit = config.CONGRESS_FMP_LIMIT
     collected: list[CongressTrade] = []
     for chamber, path in (("house", "/stable/house-latest"), ("senate", "/stable/senate-latest")):
-        url = f"{base}{path}?page=0&limit={limit}&apikey={key}"
-        data = await _fetch_json(session, url, f"FMP {chamber}")
+        # apikey goes in params (kept out of the logged URL); see _fetch_json.
+        params = {"page": 0, "limit": limit, "apikey": key}
+        data = await _fetch_json(
+            session, f"{base}{path}", f"FMP {chamber}",
+            params=params, max_bytes=config.CONGRESS_MAX_FETCH_BYTES,
+        )
         if isinstance(data, list):
             collected.extend(parse_fmp_trades(data, chamber))
     return collected

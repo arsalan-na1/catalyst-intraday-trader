@@ -390,8 +390,26 @@ CONGRESS_DATA_API_KEY        = os.getenv("CONGRESS_DATA_API_KEY", "")
 CONGRESS_TRADES_FILE         = STATE_DIR / "congress_trades.json"
 CONGRESS_FMP_BASE_URL        = os.getenv("CONGRESS_FMP_BASE_URL", "https://financialmodelingprep.com")
 CONGRESS_FMP_LIMIT           = _int("CONGRESS_FMP_LIMIT", 250)
+# Hard ceiling on a single congress-data response body. The keyless Senate dump
+# is a few MB today, but it's an operator-set external URL — cap it so a
+# repointed/compromised mirror can't OOM the Pi. Fail-open: an oversized body is
+# dropped (treated as no data).
+CONGRESS_MAX_FETCH_BYTES     = _int("CONGRESS_MAX_FETCH_BYTES", 50 * 1024 * 1024)
 CONGRESS_SENATE_FALLBACK_URL = os.getenv(
     "CONGRESS_SENATE_FALLBACK_URL",
     "https://raw.githubusercontent.com/timothycarambat/"
     "senate-stock-watcher-data/master/aggregate/all_transactions.json",
 )
+
+# Virtual copy portfolio (Phase 2). OFF by default: when CONGRESS_COPY_ENABLED is
+# false the scheduler task is not started and this feature is fully inert, so the
+# bot behaves byte-identically to today. The portfolio places NO Alpaca orders and
+# shares no state with the scalper — it marks to market against live prices in its
+# own state file.
+CONGRESS_COPY_ENABLED     = _bool("CONGRESS_COPY_ENABLED", False)
+CONGRESS_SIZING_MODE      = os.getenv("CONGRESS_SIZING_MODE", "equal_weight")  # equal_weight | range_tier
+CONGRESS_EQUAL_WEIGHT_USD = _float("CONGRESS_EQUAL_WEIGHT_USD", 1000.0)   # virtual $ per disclosed buy (range_tier base unit)
+CONGRESS_VIRTUAL_EQUITY_USD = _float("CONGRESS_VIRTUAL_EQUITY_USD", 100000.0)  # virtual account size
+CONGRESS_PORTFOLIO_FILE   = STATE_DIR / "congress_portfolio.json"
+CONGRESS_FRESHNESS_DAYS   = _int("CONGRESS_FRESHNESS_DAYS", 60)  # only act on disclosures this recent (covers the ~45-day lag + buffer)
+CONGRESS_REFRESH_HOURS    = _int("CONGRESS_REFRESH_HOURS", 24)   # daily cadence — never the intraday hot path

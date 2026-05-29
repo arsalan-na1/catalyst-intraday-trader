@@ -54,6 +54,10 @@ marked at the disclosure date; mark-to-market against live prices. Own state fil
 
 ## Sizing (decided)
 Equal-weight (fixed `$` per disclosed buy) — lowest-variance, most comparable benchmark;
+Note: a position is capped at remaining virtual cash, so once the account is fully
+deployed, late-cycle entries are under-weighted (partial fills) rather than skipped — set
+`CONGRESS_VIRTUAL_EQUITY_USD` high enough relative to `CONGRESS_EQUAL_WEIGHT_USD` that the
+book rarely runs out of cash, or treat full-deployment periods as a known caveat.
 sidesteps range-collapse. `amount_min`/`amount_max` are persisted so range-tier weighting
 is a later one-flag switch. **Not** Autopilot-proportional (can't faithfully replicate it
 without each member's full portfolio + their algorithm; collapsing ranges adds noise).
