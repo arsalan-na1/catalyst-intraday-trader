@@ -98,10 +98,42 @@ def test_should_open_rejects_pre_start_disclosure():
     assert p.should_open(_trade(disc="2026-05-10"), "2026-05-29", 60) is False
 
 
-def test_should_open_rejects_too_stale_disclosure():
-    # Older than freshness_days even though after start → stale-data handling.
+def test_should_open_rejects_old_transaction_even_if_recently_disclosed():
+    # Case 3: the disclosure lag can exceed a year. A trade executed long ago is
+    # a dead signal even when disclosed today — freshness is measured on the
+    # TRANSACTION date, not on how recently it was disclosed.
     p = _portfolio(started="2026-01-01")
-    assert p.should_open(_trade(disc="2026-03-01"), today="2026-05-29", freshness_days=30) is False
+    stale = _trade(tx="2026-01-15", disc="2026-05-20")  # ~134-day-old trade, fresh disclosure
+    assert p.should_open(stale, today="2026-05-29", freshness_days=60) is False
+
+
+def test_should_open_accepts_normal_disclosure_lag():
+    # A typical ~40-day-lag trade (transaction within freshness) still opens.
+    p = _portfolio(started="2026-05-15")
+    fresh = _trade(tx="2026-04-20", disc="2026-05-20")  # 39-day-old trade
+    assert p.should_open(fresh, today="2026-05-29", freshness_days=60) is True
+
+
+def test_should_open_rejects_missing_transaction_date():
+    # Fail-closed: can't assess staleness without a transaction date.
+    p = _portfolio(started="2026-05-15")
+    assert p.should_open(_trade(tx="", disc="2026-05-20"), today="2026-05-29", freshness_days=60) is False
+
+
+def test_should_open_rejects_future_transaction_date():
+    # A future-dated transaction (clock skew / bad data) is rejected by the
+    # 0 <= tx_age lower bound, independent of the disclosure-date check.
+    p = _portfolio(started="2026-05-15")
+    assert p.should_open(_trade(tx="2026-06-10", disc="2026-05-20"), today="2026-05-29", freshness_days=60) is False
+
+
+@pytest.mark.parametrize("tx, expected", [
+    ("2026-03-30", True),    # exactly 60 days before today=2026-05-29 → accept (<=)
+    ("2026-03-29", False),   # 61 days → reject
+])
+def test_should_open_freshness_boundary(tx, expected):
+    p = _portfolio(started="2026-01-01")
+    assert p.should_open(_trade(tx=tx, disc="2026-05-20"), today="2026-05-29", freshness_days=60) is expected
 
 
 def test_should_open_rejects_already_seen():
@@ -149,6 +181,16 @@ def test_apply_disclosures_opens_fresh_buys_and_mirrors_sells():
     assert len(opened) == 1
     assert p.open[opened[0]].ticker == "AAPL"
     assert closed == []
+
+
+def test_non_tradeable_adr_without_price_is_not_opened():
+    # Case 4: ADR/OTC names with no Alpaca snapshot price never become positions
+    # — the portfolio is virtual and price-gated, so there are no failed/zero-fill
+    # orders, just no position.
+    p = _portfolio(started="2026-05-15")
+    trades = [_trade(ticker="IFNNY", disc="2026-05-20"), _trade(ticker="SFGYY", disc="2026-05-21")]
+    opened, closed = p.apply_disclosures(trades, prices={}, today="2026-05-29", freshness_days=60)
+    assert opened == [] and p.open == {}
 
 
 # --- mark to market ----------------------------------------------------------

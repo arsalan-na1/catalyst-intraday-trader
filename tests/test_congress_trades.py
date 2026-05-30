@@ -82,6 +82,7 @@ def test_amount_range_keeps_both_bounds_not_a_point():
 @pytest.mark.parametrize("raw, expected", [
     ("AAPL", "AAPL"), ("aapl", "AAPL"), ("  msft ", "MSFT"), ("$TSLA", "TSLA"),
     ("BRK.B", "BRK.B"), ("BRK-B", "BRK-B"), ("F", "F"),
+    ("OTIS (1)", "OTIS"), ("OTIS (2)", "OTIS"), ("AAPL (10)", "AAPL"),  # split-lot markers stripped
     ("--", None), ("", None), ("N/A", None), (None, None),
     ("AAPL240119C00150000", None),  # option contract symbol
     ("123", None),                  # numeric junk
@@ -92,8 +93,8 @@ def test_normalize_ticker(raw, expected):
 
 @pytest.mark.parametrize("raw, expected", [
     ("Purchase", "buy"), ("purchase", "buy"), ("BUY", "buy"),
-    ("Sale (Full)", "sell"), ("Sale (Partial)", "sell"), ("sale", "sell"),
-    ("Exchange", None), ("", None), (None, None),
+    ("Sale", "sell"), ("Sale (Full)", "sell"), ("Sale (Partial)", "sell"), ("sale", "sell"),
+    ("Exchange", None), ("", None), (None, None),  # Exchange/other → ignored
 ])
 def test_normalize_transaction_type(raw, expected):
     assert ct.normalize_transaction_type(raw) == expected
@@ -108,12 +109,15 @@ def test_parse_date(raw, expected):
 
 
 @pytest.mark.parametrize("asset_type, expected", [
-    ("Stock", True), ("Common Stock", True), ("", True), (None, True),
-    ("Stock Option", False), ("Corporate Bond", False), ("Municipal Security", False),
-    ("ETF", False), ("Crypto", False),
+    ("Stock", True), ("stock", True), ("  Stock ", True),
+    ("REIT", False),               # explicit decision: REIT excluded by default (config-opt-in)
+    ("Corporate Bond", False),     # a bond must never become a stock buy (case 1)
+    ("Stock Option", False), ("Municipal Security", False), ("ETF", False), ("Crypto", False),
+    ("Common Stock", False),       # strict allowlist: only configured types (default {"stock"})
+    ("", False), (None, False),    # fail-closed: an unknown/missing asset type is NOT copyable
 ])
-def test_is_equity(asset_type, expected):
-    assert ct._is_equity(asset_type) is expected
+def test_is_copyable_asset(asset_type, expected):
+    assert ct._is_copyable_asset(asset_type) is expected
 
 
 # --- source parsers ---------------------------------------------------------
@@ -141,6 +145,80 @@ def test_parse_senate_falls_back_to_date_recieved_and_name_parts():
     t = ct.parse_senate_stock_watcher(rec)[0]
     assert t.member == "Jane A Doe"
     assert t.disclosure_date == "2024-01-20"  # date_recieved used when disclosure_date absent
+
+
+def test_bond_with_equity_ticker_is_never_copied():
+    # Case 1: live data has Corporate Bond rows carrying equity tickers
+    # (e.g. OTIS/JPM). A bond disclosure must NEVER become a stock buy.
+    rows = [
+        {"transaction_date": "01/02/2024", "ticker": "OTIS", "asset_type": "Corporate Bond",
+         "type": "Purchase", "amount": "$1,001 - $15,000", "senator": "X", "disclosure_date": "02/15/2024"},
+        {"transaction_date": "01/02/2024", "ticker": "JPM", "asset_type": "Corporate Bond",
+         "type": "Purchase", "amount": "$1,001 - $15,000", "senator": "X", "disclosure_date": "02/15/2024"},
+    ]
+    assert ct.parse_senate_stock_watcher(rows) == []
+
+
+def test_fmp_reit_excluded_by_default():
+    # Case 1: REIT is not "Stock"; excluded under the default allowlist.
+    rows = [{"symbol": "O", "assetType": "REIT", "type": "Purchase", "amount": "$1,001 - $15,000",
+             "representative": "X", "transactionDate": "2024-01-02", "disclosureDate": "2024-02-15"}]
+    assert ct.parse_fmp_trades(rows, "house") == []
+
+
+def test_only_stock_assettype_is_copied():
+    rows = [
+        {"symbol": "AAPL", "assetType": "Stock", "type": "Purchase", "amount": "$1,001 - $15,000",
+         "representative": "Rep A", "transactionDate": "2024-01-02", "disclosureDate": "2024-02-15"},
+        {"symbol": "OTIS", "assetType": "Corporate Bond", "type": "Purchase", "amount": "$1,001 - $15,000",
+         "representative": "Rep A", "transactionDate": "2024-01-02", "disclosureDate": "2024-02-15"},
+        {"symbol": "O", "assetType": "REIT", "type": "Purchase", "amount": "$1,001 - $15,000",
+         "representative": "Rep A", "transactionDate": "2024-01-02", "disclosureDate": "2024-02-15"},
+    ]
+    trades = ct.parse_fmp_trades(rows, "house")
+    assert [t.ticker for t in trades] == ["AAPL"]  # only the Stock row survives
+
+
+def test_stock_sale_with_blank_assettype_still_exits():
+    # Sell side is lenient (never suppress a risk-reducing exit): a held stock's
+    # SALE must still produce a sell trade even when the row's assetType is
+    # blank/missing — otherwise the mirror-exit would never fire and the virtual
+    # book would be stuck long.
+    rows = [{"transaction_date": "01/02/2024", "ticker": "AAPL", "asset_type": "",
+             "type": "Sale (Full)", "amount": "$1,001 - $15,000", "senator": "Jane Doe",
+             "disclosure_date": "02/15/2024"}]
+    trades = ct.parse_senate_stock_watcher(rows)
+    assert [(t.ticker, t.transaction_type) for t in trades] == [("AAPL", "sell")]
+
+
+def test_bond_sale_is_dropped_so_it_cannot_false_close_a_stock():
+    # A Corporate Bond SALE must NOT become a sell trade — otherwise it would
+    # mirror-close a held stock position of the same ticker+member.
+    rows = [{"transaction_date": "01/02/2024", "ticker": "OTIS", "asset_type": "Corporate Bond",
+             "type": "Sale (Full)", "amount": "$1,001 - $15,000", "senator": "Jane Doe",
+             "disclosure_date": "02/15/2024"}]
+    assert ct.parse_senate_stock_watcher(rows) == []
+
+
+def test_reit_copied_when_opted_in(monkeypatch):
+    # The allowlist is config-driven: opting REIT in lets a REIT buy through.
+    monkeypatch.setattr(config, "CONGRESS_BUY_ASSET_TYPES", frozenset({"stock", "reit"}))
+    rows = [{"symbol": "O", "assetType": "REIT", "type": "Purchase", "amount": "$1,001 - $15,000",
+             "representative": "X", "transactionDate": "2024-01-02", "disclosureDate": "2024-02-15"}]
+    assert [t.ticker for t in ct.parse_fmp_trades(rows, "house")] == ["O"]
+
+
+def test_split_lots_same_amount_dedupe_to_one():
+    # Case 5: one transaction reported in parts, marked (1)/(2) on the ticker.
+    # They normalize to the same symbol and dedupe to a single intended trade.
+    rows = [
+        {"transaction_date": "01/02/2024", "ticker": "OTIS (1)", "asset_type": "Stock",
+         "type": "Purchase", "amount": "$1,001 - $15,000", "senator": "Jane Doe", "disclosure_date": "02/15/2024"},
+        {"transaction_date": "01/02/2024", "ticker": "OTIS (2)", "asset_type": "Stock",
+         "type": "Purchase", "amount": "$1,001 - $15,000", "senator": "Jane Doe", "disclosure_date": "02/15/2024"},
+    ]
+    trades = ct.dedupe(ct.parse_senate_stock_watcher(rows))
+    assert len(trades) == 1 and trades[0].ticker == "OTIS"
 
 
 def test_parse_fmp_trades_house_and_senate():

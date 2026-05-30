@@ -36,13 +36,30 @@ Normalized record `CongressTrade`: `member, chamber, ticker, transaction_type (b
 transaction_date, disclosure_date, amount_min, amount_max, source` + `lag_days` property.
 
 ### The three inherent realities
-- **45-day delay:** retain BOTH dates; expose `lag_days`; the virtual portfolio enters at
-  the **disclosure date** (when a copier could act), never the trade date.
+- **Disclosure delay (≈45 days, up to >1 year):** retain BOTH dates; expose `lag_days`.
+  **Freshness is gated on the TRANSACTION date** (`CONGRESS_FRESHNESS_DAYS`, default 60):
+  a trade executed longer ago than that is a dead signal even if just disclosed, so it is
+  not opened. The virtual position's entry is recorded at first-seen (when a copier could
+  act), never backdated.
 - **Dollar RANGES:** parse `amount` to `amount_min`/`amount_max` bounds; never collapse to a
   point. (Range-tier sizing is then a one-flag switch later.)
 - **Dedup + ticker normalization:** dedup on `(member, ticker, transaction_date, type,
-  amount)`; normalize tickers (uppercase, class suffixes ok, drop `--`/options/blank/
-  non-equity); copy only BUYs of equities.
+  amount)`; normalize tickers (uppercase, class suffixes ok), and strip a trailing
+  split-lot marker (`OTIS (1)`/`(2)`) so the parts of one transaction collapse to one.
+
+### Data hygiene (verified against live FMP / Senate shapes)
+- **Asset type — allowlist, not denylist.** Copy only `assetType` in
+  `CONGRESS_BUY_ASSET_TYPES` (default `{"stock"}`), applied to buys *and* sells.
+  **Corporate Bond / REIT / options / ETFs and any unrecognized label are excluded**, so a
+  bond row carrying an equity ticker (OTIS/JPM) can never become a stock buy. **REIT is
+  excluded by default** (decision: not labelled "Stock"; opt in via the config). Fail-closed:
+  a blank/missing `assetType` is not copyable.
+- **Transaction type:** `Purchase` → copy-buy; `Sale` / `Sale (Partial)` → mirror-exit;
+  `Exchange` / anything else → ignored.
+- **Tradeability:** the portfolio is virtual and **price-gated** — a ticker with no Alpaca
+  IEX snapshot price (typical for OTC/ADR names like IFNNY/SFGYY) simply never opens a
+  position. No real orders exist, so non-tradeable names cannot become failed/zero-fill
+  fills. (Broader option, not implemented: gate against Alpaca's tradable-assets list.)
 
 ## Virtual portfolio — `congress_portfolio.py` (Phase 2, gated)
 Gated by `CONGRESS_COPY_ENABLED` (default false). On the daily pull, open a virtual

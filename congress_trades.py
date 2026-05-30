@@ -43,13 +43,11 @@ log = logging.getLogger("congress_trades")
 
 _BUY_WORDS = ("purchase", "buy")
 _SELL_WORDS = ("sale", "sell")
-# Non-equity asset labels we never copy (the benchmark copies ordinary stock).
-_NON_EQUITY_MARKERS = (
-    "option", "bond", "note", "fund", "etf", "crypto", "future", "warrant",
-    "municipal", "treasur",
-)
 # AAPL, F, GOOGL, BRK.B, BF.B, BRK-B — letters with an optional class suffix.
 _TICKER_RE = re.compile(r"^[A-Z]{1,5}(?:[.\-][A-Z]{1,2})?$")
+# Trailing split-lot marker some disclosures append when one transaction is
+# reported in parts: "OTIS (1)" / "OTIS (2)".
+_LOT_MARKER_RE = re.compile(r"\s*\(\d+\)$")
 
 
 @dataclass(frozen=True)
@@ -107,10 +105,14 @@ def parse_amount_range(raw) -> tuple[float, float]:
 
 
 def normalize_ticker(raw) -> str | None:
-    """Uppercase/clean a ticker; return None for unknown/non-equity symbols."""
+    """Uppercase/clean a ticker; return None for unknown/non-equity symbols.
+
+    Strips a trailing split-lot marker (" (1)"/"(2)") so the parts of one
+    transaction normalize to the same symbol and dedupe to a single trade."""
     if not isinstance(raw, str):
         return None
     t = raw.strip().upper().lstrip("$").strip()
+    t = _LOT_MARKER_RE.sub("", t).strip()
     if not t or t in ("--", "—", "-", "N/A", "NA", "NONE"):
         return None
     if not _TICKER_RE.match(t):
@@ -154,14 +156,37 @@ def parse_date(raw) -> str:
     return ""
 
 
-def _is_equity(asset_type) -> bool:
-    """True unless the asset is explicitly labelled non-equity (option/bond/...).
+def _is_copyable_asset(asset_type) -> bool:
+    """True only when the disclosed assetType is in the copy allowlist
+    (config.CONGRESS_BUY_ASSET_TYPES, default {"stock"}).
 
-    Unspecified ('' / None) is allowed — ticker validity is the real gate."""
+    Allowlist, not denylist: only the configured types are copyable, so REIT /
+    Corporate Bond / options / ETFs and any *unrecognized* label are excluded —
+    a bond row carrying an equity ticker (OTIS/JPM) can never become a stock
+    buy. Fail-closed: a missing/blank assetType is NOT copyable."""
     if not asset_type or not isinstance(asset_type, str):
-        return True
-    low = asset_type.strip().lower()
-    return not any(marker in low for marker in _NON_EQUITY_MARKERS)
+        return False
+    return asset_type.strip().lower() in config.CONGRESS_BUY_ASSET_TYPES
+
+
+def _asset_ok_for(ttype: str, asset_type) -> bool:
+    """Direction-aware asset-type gate (matches the repo's risk posture:
+    fail-closed on the risky action, never suppress a risk-reducing one):
+
+      * BUY  — strict allowlist, fail-closed: open ONLY an affirmatively
+               copyable assetType. A Corporate Bond / REIT / option / ETF or a
+               blank/unknown label never becomes a buy.
+      * SELL — lenient: mirror the exit unless the asset is affirmatively a type
+               we'd never hold. A held stock still closes even when its sale row
+               carries a blank/odd assetType, while a bond SALE (not in the
+               allowlist) is still dropped so it can't false-close a stock
+               position of the same ticker+member.
+    """
+    if ttype == "buy":
+        return _is_copyable_asset(asset_type)
+    if not isinstance(asset_type, str) or not asset_type.strip():
+        return True  # blank/unknown sell → allow the exit (don't miss it)
+    return asset_type.strip().lower() in config.CONGRESS_BUY_ASSET_TYPES
 
 
 def _member_name(*candidates) -> str:
@@ -180,11 +205,11 @@ def parse_senate_stock_watcher(records: Iterable[dict]) -> list[CongressTrade]:
     for r in records or []:
         if not isinstance(r, dict):
             continue
-        if not _is_equity(r.get("asset_type")):
-            continue
         ticker = normalize_ticker(r.get("ticker"))
         ttype = normalize_transaction_type(r.get("type"))
         if ticker is None or ttype is None:
+            continue
+        if not _asset_ok_for(ttype, r.get("asset_type")):
             continue
         lo, hi = parse_amount_range(r.get("amount"))
         member = _member_name(
@@ -208,11 +233,11 @@ def parse_fmp_trades(records: Iterable[dict], chamber: str) -> list[CongressTrad
     for r in records or []:
         if not isinstance(r, dict):
             continue
-        if not _is_equity(r.get("assetType") or r.get("asset_type")):
-            continue
         ticker = normalize_ticker(r.get("symbol") or r.get("ticker"))
         ttype = normalize_transaction_type(r.get("type"))
         if ticker is None or ttype is None:
+            continue
+        if not _asset_ok_for(ttype, r.get("assetType") or r.get("asset_type")):
             continue
         lo, hi = parse_amount_range(r.get("amount"))
         member = _member_name(

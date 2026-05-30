@@ -121,23 +121,31 @@ class CongressPortfolio:
         return key in self.open or any(c.get("key") == key for c in self.closed)
 
     def should_open(self, trade: CongressTrade, today: str, freshness_days: int) -> bool:
-        """A disclosed buy is openable iff it is a new (unseen) BUY whose
-        disclosure date is on/after we started tracking and within
-        `freshness_days` of `today` — so we never backfill the historical dump
-        nor act on a disclosure that is too stale even by this lagging feed's
-        standards."""
+        """A disclosed buy is openable iff it is a new (unseen) BUY that:
+          * was disclosed on/after we started tracking (no historical backfill),
+          * was disclosed no later than today (no future / clock-skew rows), and
+          * was EXECUTED within `freshness_days` of today.
+
+        Freshness is measured on the TRANSACTION date, not the disclosure date:
+        the legal disclosure lag can exceed a year, so a trade executed long ago
+        is a dead signal even when it was only just disclosed. Fail-closed on a
+        missing or unparseable transaction/disclosure date."""
         if trade.transaction_type != "buy":
             return False
         if self._seen(position_key(trade)):
             return False
-        disc = trade.disclosure_date
+        disc, tx = trade.disclosure_date, trade.transaction_date
         if not disc or disc < self.started_on:
             return False
         try:
-            age = (date.fromisoformat(today) - date.fromisoformat(disc)).days
-        except ValueError:
+            today_d = date.fromisoformat(today)
+            disc_age = (today_d - date.fromisoformat(disc)).days
+            tx_age = (today_d - date.fromisoformat(tx)).days
+        except (ValueError, TypeError):
+            return False  # missing/unparseable date → can't assess staleness → fail closed
+        if disc_age < 0:                      # disclosed in the future (clock skew)
             return False
-        return 0 <= age <= freshness_days
+        return 0 <= tx_age <= freshness_days   # executed recently enough, not future-dated
 
     def open_from_trade(self, trade: CongressTrade, price: float | None, today: str) -> VirtualPosition | None:
         if price is None or price <= 0:

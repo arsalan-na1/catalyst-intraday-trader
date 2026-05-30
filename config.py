@@ -390,6 +390,16 @@ CONGRESS_DATA_API_KEY        = os.getenv("CONGRESS_DATA_API_KEY", "")
 CONGRESS_TRADES_FILE         = STATE_DIR / "congress_trades.json"
 CONGRESS_FMP_BASE_URL        = os.getenv("CONGRESS_FMP_BASE_URL", "https://financialmodelingprep.com")
 CONGRESS_FMP_LIMIT           = _int("CONGRESS_FMP_LIMIT", 250)
+# Allowlist of disclosure assetType values the copy-buy acts on (lowercased,
+# comma-separated). Default "stock" only — so Corporate Bond / REIT / options /
+# ETFs are NOT copied, and a bond row carrying an equity ticker (e.g. OTIS/JPM)
+# can never become a stock buy. Fail-closed: an unknown/blank assetType is not
+# copyable. Add "reit" etc. here to opt those in.
+CONGRESS_BUY_ASSET_TYPES = frozenset(
+    a.strip().lower()
+    for a in os.getenv("CONGRESS_BUY_ASSET_TYPES", "stock").split(",")
+    if a.strip()
+)
 # Hard ceiling on a single congress-data response body. The keyless Senate dump
 # is a few MB today, but it's an operator-set external URL — cap it so a
 # repointed/compromised mirror can't OOM the Pi. Fail-open: an oversized body is
@@ -411,5 +421,5 @@ CONGRESS_SIZING_MODE      = os.getenv("CONGRESS_SIZING_MODE", "equal_weight")  #
 CONGRESS_EQUAL_WEIGHT_USD = _float("CONGRESS_EQUAL_WEIGHT_USD", 1000.0)   # virtual $ per disclosed buy (range_tier base unit)
 CONGRESS_VIRTUAL_EQUITY_USD = _float("CONGRESS_VIRTUAL_EQUITY_USD", 100000.0)  # virtual account size
 CONGRESS_PORTFOLIO_FILE   = STATE_DIR / "congress_portfolio.json"
-CONGRESS_FRESHNESS_DAYS   = _int("CONGRESS_FRESHNESS_DAYS", 60)  # only act on disclosures this recent (covers the ~45-day lag + buffer)
+CONGRESS_FRESHNESS_DAYS   = _int("CONGRESS_FRESHNESS_DAYS", 60)  # max TRANSACTION age (days) to copy: a trade executed longer ago than this is a dead signal even if just disclosed (lag can exceed a year)
 CONGRESS_REFRESH_HOURS    = _int("CONGRESS_REFRESH_HOURS", 24)   # daily cadence — never the intraday hot path
