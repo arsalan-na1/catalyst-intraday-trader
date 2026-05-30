@@ -13,7 +13,7 @@ python3 -m py_compile bot.py stream.py news.py scorer.py technicals.py trader.py
     fundamentals.py finnhub_data.py reddit_sentiment.py premarket_scanner.py \
     short_interest.py estimate_revisions.py sector_momentum.py market_regime.py
 
-# Run unit tests (130 tests: pure functions in test_core.py + mocked scorer/cost/entry-gate suites)
+# Run unit tests (245 tests: pure functions in test_core.py + mocked scorer/cost/entry-gate suites)
 python -m pytest tests/ -v
 
 # End-to-end pipeline test (works outside market hours; skips real stream)
@@ -49,7 +49,7 @@ ssh aso@192.168.1.183 "cat ~/trading-bot/state/trade_log.jsonl"
 ssh aso@192.168.1.183 "cat ~/trading-bot/state/open_positions.json"
 ```
 
-All config is in `.env` (see `.env.example`). Two automated checks: `python3 -m py_compile` (syntax) and `python -m pytest tests/` (130 unit tests: pure functions plus mocked scorer/cost-accounting/entry-gate suites). Run both on any change before considering work done.
+All config is in `.env` (see `.env.example`). Two automated checks: `python3 -m py_compile` (syntax) and `python -m pytest tests/` (245 unit tests: pure functions plus mocked scorer/cost-accounting/entry-gate suites). Run both on any change before considering work done.
 
 ---
 
