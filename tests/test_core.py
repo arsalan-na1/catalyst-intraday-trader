@@ -387,7 +387,12 @@ def test_risk_cap_reduces_size_when_stop_widens():
 
 
 def test_risk_cap_never_increases_size():
-    """The risk cap must only reduce — never inflate — the Gemini size."""
+    """
+    The risk cap must only reduce — never inflate — the Gemini size.
+    Test that applying the risk cap never increases the Gemini size.
+    Verify that _apply_risk_cap returns the cap value when the risk-implied size would be larger than the cap.
+    Raises AssertionError if the bound is violated.
+    """
     from trader import _apply_risk_cap
     # Gemini wants 3% on a 2% stop: risk_implied = 0.5%/2% = 25%, much larger.
     # The function must return the 3%, NOT 25%.
