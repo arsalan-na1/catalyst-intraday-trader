@@ -389,7 +389,11 @@ REFLECTION_INJECTED_TOKEN_BUDGET    = _int("REFLECTION_INJECTED_TOKEN_BUDGET", 6
 CONGRESS_DATA_API_KEY        = os.getenv("CONGRESS_DATA_API_KEY", "")
 CONGRESS_TRADES_FILE         = STATE_DIR / "congress_trades.json"
 CONGRESS_FMP_BASE_URL        = os.getenv("CONGRESS_FMP_BASE_URL", "https://financialmodelingprep.com")
-CONGRESS_FMP_LIMIT           = _int("CONGRESS_FMP_LIMIT", 250)
+CONGRESS_FMP_LIMIT           = _int("CONGRESS_FMP_LIMIT", 250)  # only sent on a paid tier (see CONGRESS_FMP_PAID_TIER)
+# FMP's FREE tier returns HTTP 402 when pagination params (page/limit) are sent
+# to the /stable/{house,senate}-latest endpoints — the bare keyed call works.
+# Default off: send only the apikey. Set true with a paid key to use page/limit.
+CONGRESS_FMP_PAID_TIER       = _bool("CONGRESS_FMP_PAID_TIER", False)
 # Allowlist of disclosure assetType values the copy-buy acts on (lowercased,
 # comma-separated). Default "stock" only — so Corporate Bond / REIT / options /
 # ETFs are NOT copied, and a bond row carrying an equity ticker (e.g. OTIS/JPM)

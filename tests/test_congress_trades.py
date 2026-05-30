@@ -316,6 +316,45 @@ def test_fetch_trades_uses_fmp_when_key_present(monkeypatch):
     assert {t.ticker for t in trades} == {"GOOGL", "BRK.B", "COST"}
 
 
+def _capture_fmp_params(monkeypatch):
+    """Run fetch_trades with FMP selected and return the params dict of each
+    outgoing request."""
+    monkeypatch.setattr(config, "CONGRESS_DATA_API_KEY", "FMPKEY")
+    seen: list[dict] = []
+
+    async def _f(session, url, **kwargs):
+        assert "FMPKEY" not in url  # secret must travel via params, never the URL string
+        seen.append(kwargs.get("params"))
+        return (200, "[]")
+
+    monkeypatch.setattr(ct, "fetch_with_retry", _f)
+    asyncio.run(ct.fetch_trades(None))
+    return seen
+
+
+def test_fetch_fmp_omits_pagination_params_on_free_tier(monkeypatch):
+    # BUG (prove-it): FMP's FREE tier returns HTTP 402 when page/limit are
+    # present on /stable/{house,senate}-latest. The default request must send
+    # ONLY apikey (one request per chamber).
+    seen = _capture_fmp_params(monkeypatch)
+    assert len(seen) == 2  # house + senate
+    for p in seen:
+        assert set(p) == {"apikey"}        # no "page", no "limit"
+        assert p["apikey"] == "FMPKEY"
+
+
+def test_fetch_fmp_sends_pagination_only_on_paid_tier(monkeypatch):
+    # A paid key may use pagination; gated behind an explicit opt-in flag.
+    monkeypatch.setattr(config, "CONGRESS_FMP_PAID_TIER", True)
+    monkeypatch.setattr(config, "CONGRESS_FMP_LIMIT", 250)
+    seen = _capture_fmp_params(monkeypatch)
+    assert len(seen) == 2
+    for p in seen:
+        assert set(p) == {"apikey", "page", "limit"}  # no stray params leak in
+        assert p["apikey"] == "FMPKEY"
+        assert p["page"] == 0 and p["limit"] == 250
+
+
 @pytest.mark.parametrize("bad", [None, (500, ""), (200, "not json"), (403, "")])
 def test_fetch_trades_fails_open(monkeypatch, bad):
     monkeypatch.setattr(config, "CONGRESS_DATA_API_KEY", "")

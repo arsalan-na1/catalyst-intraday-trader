@@ -355,11 +355,16 @@ async def _fetch_senate_stock_watcher(session) -> list[CongressTrade]:
 async def _fetch_fmp(session) -> list[CongressTrade]:
     key = config.CONGRESS_DATA_API_KEY
     base = config.CONGRESS_FMP_BASE_URL.rstrip("/")
-    limit = config.CONGRESS_FMP_LIMIT
     collected: list[CongressTrade] = []
     for chamber, path in (("house", "/stable/house-latest"), ("senate", "/stable/senate-latest")):
-        # apikey goes in params (kept out of the logged URL); see _fetch_json.
-        params = {"page": 0, "limit": limit, "apikey": key}
+        # apikey goes in params (kept out of the logged URL; see _fetch_json).
+        # FMP's FREE tier returns HTTP 402 when pagination params (page/limit)
+        # are present on these *-latest endpoints — the bare keyed call returns
+        # data. Send page/limit ONLY on a paid tier (opt-in, default off).
+        params = {"apikey": key}
+        if config.CONGRESS_FMP_PAID_TIER:
+            params["page"] = 0
+            params["limit"] = config.CONGRESS_FMP_LIMIT
         data = await _fetch_json(
             session, f"{base}{path}", f"FMP {chamber}",
             params=params, max_bytes=config.CONGRESS_MAX_FETCH_BYTES,
